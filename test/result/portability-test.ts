@@ -42,19 +42,30 @@ module('Result | portability', { concurrency: true }, () => {
       `Failure.setDebug(true);` + // debug line must fall back to console.error, not crash
       `Task(() => Promise.reject(new Error('gone'))).ignore('browser cleanup');` +
       `await new Promise((res) => setTimeout(res, 10));` +
-      `console.log('OK', parsed.value.n, doubled, Failure.is(failed), failed.code,` +
-      `  streamed.values.length, streamed.errors.length, sup.count(), echoed);`;
+      // ONE already-joined string, deliberately: console.log runs every non-string argument
+      // through util.inspect, which colorises based on the ambient COLORTERM/TERM/FORCE_COLOR
+      // — so `console.log('OK', 1, …)` prints `OK \x1b[33m1\x1b[39m …` from an interactive
+      // shell and bare `OK 1 …` from CI. The subject here is the values, never their rendering.
+      `console.log(['OK', parsed.value.n, doubled, Failure.is(failed), failed.code,` +
+      `  streamed.values.length, streamed.errors.length, sup.count(), echoed].join(' '));`;
     const child = spawn(process.execPath, ['--input-type=module', '-e', script]);
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => (stdout += chunk));
     child.stderr.on('data', (chunk) => (stderr += chunk));
     const code = await new Promise<number | null>((resolve) => child.on('close', resolve));
+    // Every message below carries the child's own output: this test's whole subject is a
+    // process we cannot step into, so an assertion that reports only `false !== true` costs
+    // an entire debugging session the next time it fails.
     assert.strictEqual(code, 0, `clean exit, got stderr: ${stderr}`);
-    assert.true(stdout.includes('OK 1 42 true FileMissing 2 1 0 7'), 'the full surface worked');
+    assert.strictEqual(
+      stdout.trim(),
+      'OK 1 42 true FileMissing 2 1 0 7',
+      `the full surface worked — stderr was: ${stderr}`,
+    );
     assert.true(
       stderr.includes('ignored (browser cleanup)'),
-      'the debug line reached console.error without a process.stderr',
+      `the debug line reached console.error without a process.stderr — stderr was: ${stderr}`,
     );
   });
 });
