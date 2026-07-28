@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          # Warm DENO_DIR (keyed on the lockfile) so the type-check cache is reused across
+          # runs — the --doc gates below re-check doc blocks correctly on cached content.
+          cache: true
+      - run: npm ci
+      - run: npm run format
+      - run: npm run lint
+      - run: npm run lint:docs
+      # Rust-style doctests, both halves: `typecheck` TYPE-CHECKS every JSDoc example
+      # (deno check --doc); `test:doctest` RUNS them under a sandbox allowing only env reads,
+      # /tmp reads and read-only system metadata — an example that writes, connects or spawns
+      # fails loudly.
+      - run: npm run typecheck
+      - run: npm run test:doctest
+      # Promises/A+ compliance for lib/task — 872 tests, ~13s, cheaper here than in the matrix.
+      - run: npm run test:aplus
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: npm ci
+      - run: npm test
+      - run: npm run test:deno
+      # The npm artifact is the thing consumers actually load: build it, then import every
+      # entry point through the exports map from outside the package.
+      - run: npm run build
+      - run: node scripts/smoke-package.js
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance + JSR OIDC — no tokens for the JSR half
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: npm ci
+      - run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: deno publish

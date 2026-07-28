@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    // `esnext` for the lib, not the target: Task extends Promise and overrides `try` and
+    // `withResolvers`, which only exist on the base class in the newest lib. Deno's built-in
+    // lib already has them, which is why `deno check` never needed this.
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "exactOptionalPropertyTypes": false,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+
+    // The source is Node-24-native TypeScript: `.ts` specifiers everywhere, no syntax the
+    // runtime cannot simply erase. `rewriteRelativeImportExtensions` is what makes the same
+    // files both directly runnable (node lib/…, deno lib/…) and compilable to `.js` for npm.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "erasableSyntaxOnly": true,
+
+    "noEmit": true
+  },
+  "include": ["lib/**/*.ts", "test/**/*.ts", "examples/**/*.ts", "mod.ts"]
+}

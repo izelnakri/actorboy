@@ -1,0 +1,36 @@
+{
+  "name": "@izelnakri/elixir-system",
+  "version": "0.1.0",
+  "license": "MIT",
+  "nodeModulesDir": "auto",
+  "exports": {
+    ".": "./mod.ts",
+    "./result": "./lib/result/index.ts",
+    "./failure": "./lib/result/failure.ts",
+    "./task": "./lib/task/index.ts",
+    "./stream": "./lib/stream/index.ts",
+    "./supervisor": "./lib/supervisor/index.ts",
+    "./node": "./lib/node/index.ts",
+    "./node/hub": "./lib/node/hub.ts"
+  },
+  "publish": {
+    "include": ["lib/", "mod.ts", "deno.json", "README.md", "LICENSE", "docs/"],
+    "exclude": ["docs/api/"]
+  },
+  "imports": {
+    "ws": "npm:ws@^8.21.0",
+    "qunitx": "npm:qunitx@^1.2.18"
+  },
+  // Stated, not defaulted: deno reads the sibling tsconfig.json (which exists for the npm
+  // `tsc` build and therefore declares node/DOM libs), and its `lib` would otherwise displace
+  // `deno.ns` — turning every `Deno.*` reference in a generated doctest into TS2304. Naming
+  // the libs here keeps deno's own view authoritative for check, test and lint.
+  "compilerOptions": {
+    "lib": ["deno.ns", "esnext", "dom", "dom.iterable"]
+  },
+  "lint": {
+    "rules": {
+      "exclude": ["no-process-global", "no-node-globals", "no-window"]
+    }
+  }
+}
