@@ -1,4 +1,4 @@
-# elixir-system
+# actorboy
 
 Elixir/OTP's runtime model on web standards, for JavaScript and TypeScript.
 
@@ -20,8 +20,8 @@ which is what makes distribution and supervision speak the same language as a lo
 ## Install
 
 ```sh
-npm install elixir-system     # Node, bundlers
-deno add jsr:@izelnakri/elixir-system
+npm install actorboy     # Node, bundlers
+deno add jsr:@izelnakri/actorboy
 ```
 
 ## Result — the settled outcome
@@ -30,8 +30,8 @@ A success is the **value itself**; a failure is the `Failure`. No box, no tuple,
 on the happy path.
 
 ```ts
-import * as Result from 'elixir-system/result';
-import * as Failure from 'elixir-system/failure';
+import * as Result from 'actorboy/result';
+import * as Failure from 'actorboy/failure';
 
 const NotFound = Failure.define('NotFound', (d: { id: number }) => `no user ${d.id}`);
 
@@ -53,7 +53,7 @@ official Promises/A+ suite (872 tests), so `await`, `Promise.all` and `try`/`cat
 but the recipe does not run until something awaits it, and it can be re-run.
 
 ```ts
-import { Task, Failure } from 'elixir-system/task'; // one leg, one import — Failure rides along
+import { Task, Failure } from 'actorboy/task'; // one leg, one import — Failure rides along
 
 const Unreachable = Failure.define('Unreachable', (d: { id: number }) => `user ${d.id} is out`);
 
@@ -77,7 +77,7 @@ A lazy async pipeline whose elements are the same bare union, and whose terminal
 return Tasks.
 
 ```ts
-import { Stream } from 'elixir-system/stream';
+import { Stream } from 'actorboy/stream';
 
 const { values, errors } = await Stream.from(sources)
   .map(fetchReport)
@@ -90,7 +90,7 @@ OTP supervision for in-process JS: the three restart policies, the three strateg
 restart-intensity budget that ends the tree loudly rather than restarting forever.
 
 ```ts
-import * as Supervisor from 'elixir-system/supervisor';
+import * as Supervisor from 'actorboy/supervisor';
 
 const tree = Supervisor.start(
   [
@@ -111,7 +111,7 @@ envelope keeps channel identity across every hop — a declared failure arrives 
 a clone-gutted `Error`.
 
 ```ts
-import * as Node from 'elixir-system/node';
+import * as Node from 'actorboy/node';
 
 const worker = Node.start('worker@ws', Node.wsTransport('ws://localhost:4369'));
 worker.handle('render', (payload) => renderPage(payload));
@@ -122,7 +122,7 @@ const html = await client.call('worker@ws', 'render', { path: '/' }, 5000);
 
 Transports: `memoryHub()` (same realm), `fromPort(worker)` (worker threads, iframes,
 `MessagePort`), `wsTransport(url)` (sockets, binary codec by default). The relay server lives
-at `elixir-system/node/hub` — the one entry point that needs `ws`, kept out of the main barrel
+at `actorboy/node/hub` — the one entry point that needs `ws`, kept out of the main barrel
 so everything else stays browser-safe and dependency-free.
 
 ### Hot code upgrades

@@ -454,7 +454,7 @@ const NODE_PROCESS = (
  * diagnostics_channel.unsubscribe(Failure.IGNORED_CHANNEL_NAME, collect);
  * ```
  */
-export const IGNORED_CHANNEL_NAME = 'elixir-system.failure.ignored';
+export const IGNORED_CHANNEL_NAME = 'actorboy.failure.ignored';
 const DIAGNOSTICS = NODE_PROCESS?.getBuiltinModule?.('node:diagnostics_channel') as
   typeof import('node:diagnostics_channel') | undefined;
 const ignoredChannel = DIAGNOSTICS?.channel(IGNORED_CHANNEL_NAME);
@@ -542,7 +542,7 @@ export function ignore(context: string): (error: unknown) => void {
     if (ignoredChannel?.hasSubscribers) ignoredChannel.publish({ context, error });
     if (!DEBUG) return;
     // stderr, not stdout: stdout is the TAP stream and a stray line there corrupts the report.
-    const line = `# [elixir-system] ignored (${context}): ${format(error)}`;
+    const line = `# [actorboy] ignored (${context}): ${format(error)}`;
     if (NODE_PROCESS?.stderr) NODE_PROCESS.stderr.write(`${line}\n`);
     else console.error(line);
   };
@@ -577,7 +577,7 @@ export function ignore(context: string): (error: unknown) => void {
  * }
  * ```
  */
-export const OBSERVED_CHANNEL_NAME = 'elixir-system.failure.observed';
+export const OBSERVED_CHANNEL_NAME = 'actorboy.failure.observed';
 const observedChannel = DIAGNOSTICS?.channel(OBSERVED_CHANNEL_NAME);
 
 /**

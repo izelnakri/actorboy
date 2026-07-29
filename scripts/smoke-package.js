@@ -23,16 +23,16 @@ const npmRun = (args, cwd) =>
   });
 
 // The consumer: one import per entry point, then a live exercise of each leg. `ws` is absent
-// here on purpose — `elixir-system/node/hub` is the only entry that needs it, and leaving it
+// here on purpose — `actorboy/node/hub` is the only entry that needs it, and leaving it
 // out proves the other seven stay installable with zero dependencies.
 const CONSUMER = `
-import { Result, Task, Stream, Supervisor, Node, Failure } from 'elixir-system';
-import * as ResultEntry from 'elixir-system/result';
-import * as FailureEntry from 'elixir-system/failure';
-import { Task as TaskEntry } from 'elixir-system/task';
-import { Stream as StreamEntry } from 'elixir-system/stream';
-import * as SupervisorEntry from 'elixir-system/supervisor';
-import * as NodeEntry from 'elixir-system/node';
+import { Result, Task, Stream, Supervisor, Node, Failure } from 'actorboy';
+import * as ResultEntry from 'actorboy/result';
+import * as FailureEntry from 'actorboy/failure';
+import { Task as TaskEntry } from 'actorboy/task';
+import { Stream as StreamEntry } from 'actorboy/stream';
+import * as SupervisorEntry from 'actorboy/supervisor';
+import * as NodeEntry from 'actorboy/node';
 import assert from 'node:assert';
 
 const NotFound = Failure.define('NotFound', (d) => \`no user \${d.id}\`);
@@ -68,7 +68,7 @@ console.log('smoke-package: OK');
 `;
 
 const projectRoot = path.resolve(import.meta.dirname, '..');
-const workspace = await mkdtemp(path.join(tmpdir(), 'elixir-system-smoke-'));
+const workspace = await mkdtemp(path.join(tmpdir(), 'actorboy-smoke-'));
 try {
   npmRun(['pack', '--pack-destination', workspace, '--ignore-scripts'], projectRoot);
   const [tarball] = (await readdir(workspace)).filter((name) => name.endsWith('.tgz'));

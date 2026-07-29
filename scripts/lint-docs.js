@@ -54,7 +54,7 @@ function run(command, args) {
 }
 
 async function doctestGateIsAlive() {
-  const dir = await mkdtemp(path.join(tmpdir(), 'elixir-system-doctest-canary-'));
+  const dir = await mkdtemp(path.join(tmpdir(), 'actorboy-doctest-canary-'));
   try {
     const canary = path.join(dir, 'canary.ts');
     await writeFile(

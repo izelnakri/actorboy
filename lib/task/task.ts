@@ -978,7 +978,7 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * returned.
    *
    * Classifying a failure also reports it to the observation seam (`Failure.observed` — the
-   * `elixir-system.failure.observed` channel plus `Failure.onObserved`), as do `match`/`unwrapOr`/
+   * `actorboy.failure.observed` channel plus `Failure.onObserved`), as do `match`/`unwrapOr`/
    * `recover`: a tracing adapter subscribed there annotates the active span with
    * `Failure.attributes(error)`, with zero tracing code at any call site.
    *

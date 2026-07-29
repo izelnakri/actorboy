@@ -1319,7 +1319,7 @@ eagerly observed (no unhandled-rejection window at fire-and-forget sites), while
 costing nothing on the normal path.
 
 Ignored failures are observable through three seams, cheapest first: on Node and Deno each
-one publishes `{ context, error }` to the `elixir-system.failure.ignored` **diagnostics_channel**
+one publishes `{ context, error }` to the `actorboy.failure.ignored` **diagnostics_channel**
 (`Failure.IGNORED_CHANNEL_NAME`) — the platform's own multi-subscriber mechanism, which APM
 agents and OpenTelemetry bridges already speak, costing one `hasSubscribers` boolean when
 nobody listens; `Failure.onIgnored(fn)` installs a single portable observer (it also works in
@@ -1330,7 +1330,7 @@ browser bundle — there the chain resolves to `undefined` and publishing is ski
 
 _Handled_ failures have the mirror-image seam, for tracing: whenever a consuming method
 (`result()`, `match`, `unwrapOr`, `recover`) classifies a rejection as a declared Failure, it
-reports through `Failure.observed` — the `elixir-system.failure.observed` channel plus the portable
+reports through `Failure.observed` — the `actorboy.failure.observed` channel plus the portable
 `Failure.onObserved(fn)` hook. A ~12-line tracing adapter subscribes once at boot, calls
 `span.recordException(error)` and `span.setAttributes(Failure.attributes(error))` on the
 active span (resolved via `AsyncLocalStorage`, which flows through Task's native promise

@@ -1,16 +1,16 @@
 // Root barrel — the whole system in one import, namespaced Noun.verb:
 //
-//   import { Result, Task, Stream, Supervisor, Node, Failure } from 'elixir-system';
+//   import { Result, Task, Stream, Supervisor, Node, Failure } from 'actorboy';
 //
 // Every namespace here is also its own entry point, which is the spelling to prefer when you
-// only need one leg (`elixir-system/task` pulls in Result + Failure and nothing else):
+// only need one leg (`actorboy/task` pulls in Result + Failure and nothing else):
 //
-//   import * as Result from 'elixir-system/result';
-//   import { Task } from 'elixir-system/task';
-//   import { Stream } from 'elixir-system/stream';
-//   import * as Supervisor from 'elixir-system/supervisor';
-//   import * as Node from 'elixir-system/node';
-//   import { startHub } from 'elixir-system/node/hub';   // the one entry that needs `ws`
+//   import * as Result from 'actorboy/result';
+//   import { Task } from 'actorboy/task';
+//   import { Stream } from 'actorboy/stream';
+//   import * as Supervisor from 'actorboy/supervisor';
+//   import * as Node from 'actorboy/node';
+//   import { startHub } from 'actorboy/node/hub';   // the one entry that needs `ws`
 //
 // The four legs are one system with one failure vocabulary: `Result` is a settled outcome,
 // `Task` a future outcome, `Stream` many outcomes over time, `Supervisor` what keeps the
