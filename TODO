@@ -1,0 +1,34 @@
+● Grounded findings — here's what genuinely doesn't exist yet (verified, not guessed), prioritized by leverage:
+
+  Tier 1 — highest leverage
+
+  A. An empirical scalability harness + node-layer benchmarks. This is the honest #1. benches/ has CLI/runner benchmarks (daemon, e2e, esbuild, tap) but nothing for the actor/node layer — so
+  "extremely scalable" is still believed, not measured. This directly closes the loop on your earlier "can I certify extremely scalable?" question, where the honest answer was "not without
+  load testing." Build it and you get: call-latency percentiles (p50/p99), throughput (msgs/sec) per node and aggregate, convergence time vs. cluster size, memory under soak (validating the
+  audit's leak fixes and the scheduler empirically), and — the real payoff — the next bottleneck surfaced under load instead of by code-reading. This is a natural multi-scenario job.
+
+  B. Security on the distribution wire. hub.ts opens a plain WebSocketServer with no auth, no TLS — any socket that connects joins the cluster. Erlang has the magic-cookie handshake + TLS
+  distribution; we have neither. For "production-grade distributed," this is an open door. Concretely: a shared-secret (cookie) check on the hello handshake, wss/TLS support in wsTransport,
+  and an optional per-subject authorization hook on handle.
+
+  Tier 2 — operability & DX
+
+  C. :observer-grade introspection + a real telemetry sink. The trace context is already OpenTelemetry-shaped and failure.ts documents an OTel adapter pattern, but there's no actual exporter —
+  no Prometheus /metrics, no OTel span export, no live mailbox/state inspection or :sys.trace-style message tracing. High value the moment anyone runs this for real.
+
+  D. Typed RPC sugar (defineService) — the design I already sketched; pure DX, closure-like call sites over name+data. Small, self-contained.
+
+  E. Dirty-CPU handler offload — completes the scheduler story: mark a handler CPU-heavy → auto-route it to the existing workerPool so it never stalls its node (the one case cooperative
+  yielding can't cover).
+
+  Tier 3 — correctness depth & parity polish
+
+  - Linearizability / Jepsen-style tests for the Raft store + sharded registry — the CP claims deserve linearizability checks, not just chaos-convergence.
+  - Selective receive (Erlang parity), priority propagation down call chains, an event-sourcing helper over Store, rolling cluster-upgrade orchestration over the existing sys.upgrade.
+
+  ---
+  My recommendation: A, then B. A is the one that turns your whole "matches Elixir at scale" thesis from argued into demonstrated — and it's the honest sequel to the question you asked two
+  turns ago. B is the one real hole in the "production-grade" claim.
+
+  Want me to build the scalability harness (A)? I'd scope it as a benches/node/ suite plus a soak/chaos-at-scale scenario, land it on #59, and report the measured numbers — including any new
+  bottleneck it exposes. Or pick any item above and I'll take it.
