@@ -844,12 +844,16 @@ export function start(
     list: (kind = 'visible') => {
       if (kind === 'this') return [name];
       if (kind === 'known') return [name, ...peers.keys()];
-      const entries = [...peers];
-      const wanted =
-        kind === 'connected'
-          ? entries
-          : entries.filter(([, v]) => (kind === 'hidden' ? v.hidden : !v.hidden));
-      return wanted.map(([n]) => n);
+      // One pass, one allocation. Spreading the map into an entries array, filtering it and then
+      // mapping it allocated three times on `visible` — which is both the default and the hottest
+      // read in the system (every `group:` route and every membership diff calls it).
+      const wanted: string[] = [];
+      for (const [peer, info] of peers) {
+        if (kind === 'connected' || (kind === 'hidden' ? info.hidden : !info.hidden)) {
+          wanted.push(peer);
+        }
+      }
+      return wanted;
     },
     join(group) {
       myGroups.add(group);
