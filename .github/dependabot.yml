@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Maintain dependencies for GitHub Actions
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    groups:
+      # upload-artifact and download-artifact share an artifact API and must
+      # be updated together to stay compatible.
+      artifact-actions:
+        patterns:
+          - 'actions/upload-artifact'
+          - 'actions/download-artifact'
+
+  # devDependencies only — this package ships with zero runtime dependencies and
+  # `ws` is an OPTIONAL peer, so a bump here can never change what a consumer
+  # installs. Grouped into one PR a week to keep the auto-merge lane quiet.
+  - package-ecosystem: 'npm'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    groups:
+      dev-dependencies:
+        dependency-type: 'development'

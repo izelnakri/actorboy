@@ -1,0 +1,92 @@
+name: Test report
+
+# Renders the test results from CI as PR-friendly check runs and inline annotations
+# (failed-test message + file:line) via dorny/test-reporter. Lives in its own workflow
+# so the test jobs stay focused on running tests; reporting is an independent concern
+# that runs after CI completes.
+#
+# Why workflow_run instead of inlining in ci.yml:
+#   - workflow_run runs in the BASE repo's permission context, even when CI was triggered
+#     by a fork PR. dorny needs `checks: write` and `pull-requests: write` to post
+#     annotations — those tokens are unavailable in fork-triggered workflows otherwise.
+#   - The test jobs stay focused on running tests. Reporting is decoupled.
+#   - If reporting fails (dorny outage, format change), test job status is unaffected.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+  checks: write
+  pull-requests: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion != 'cancelled'
+    steps:
+      # dorny/test-reporter calls `git ls-files` to map junit testcase classnames
+      # back to source paths for the check-run UI. Without the checkout it errors
+      # `fatal: not a git repository`. ref pins the workspace to the SHA that was
+      # tested in the triggering CI run, so dorny's file links resolve correctly.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: junit-*
+          path: ./junit-artifacts
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dorny/test-reporter@v3
+        if: always()
+        with:
+          name: Tests (Ubuntu)
+          path: ./junit-artifacts/junit-ubuntu-latest/*.xml
+          reporter: java-junit
+          fail-on-empty: false
+
+      - uses: dorny/test-reporter@v3
+        if: always()
+        with:
+          name: Tests (macOS)
+          path: ./junit-artifacts/junit-macos-latest/*.xml
+          reporter: java-junit
+          fail-on-empty: false
+
+      - uses: dorny/test-reporter@v3
+        if: always()
+        with:
+          name: Tests (Windows)
+          path: ./junit-artifacts/junit-windows-latest/*.xml
+          reporter: java-junit
+          fail-on-empty: false
+
+      - uses: dorny/test-reporter@v3
+        if: always()
+        with:
+          name: Tests (Deno · Ubuntu)
+          path: ./junit-artifacts/junit-deno-ubuntu-latest/*.xml
+          reporter: java-junit
+          fail-on-empty: false
+
+      - uses: dorny/test-reporter@v3
+        if: always()
+        with:
+          name: Tests (Deno · macOS)
+          path: ./junit-artifacts/junit-deno-macos-latest/*.xml
+          reporter: java-junit
+          fail-on-empty: false
+
+      - uses: dorny/test-reporter@v3
+        if: always()
+        with:
+          name: Tests (Deno · Windows)
+          path: ./junit-artifacts/junit-deno-windows-latest/*.xml
+          reporter: java-junit
+          fail-on-empty: false

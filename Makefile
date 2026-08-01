@@ -2,7 +2,23 @@
 
 LEVEL ?= patch
 
-.PHONY: build check clean docs fix fmt format help lint lint-docs release smoke test test-aplus test-deno test-doctest typecheck
+.PHONY: bench bench-check bench-update build check ci clean coverage docs fix fmt format help lint lint-docs release smoke test test-aplus test-deno test-doctest typecheck
+
+# Runs every benchmark and prints the table (no gate). Deno-only surface: Deno.bench.
+bench:
+	deno task bench
+
+# The gate CI runs: each bench file in its own subprocess, compared against the committed
+# baseline in benches/results.json. Sub-millisecond benches are observational — they colour
+# and print but only fail the build at 10x the threshold, because commodity-hardware noise
+# at that scale is indistinguishable from a real regression.
+bench-check:
+	deno task bench:check
+
+# Re-records the baseline. Do this on an idle machine, and commit the result with the change
+# that justifies it.
+bench-update:
+	deno task bench:update
 
 # Compiles lib/ + mod.ts to dist/ (ESM + .d.ts + maps). The `.ts` import specifiers in the
 # source are rewritten to `.js` by tsc's rewriteRelativeImportExtensions, which is what lets
@@ -13,8 +29,15 @@ build:
 # Everything CI runs, in the order that fails cheapest first.
 check: format lint lint-docs typecheck test-doctest test test-deno test-aplus
 
+# `check` plus the two gates that need a build or a baseline — the full CI surface, locally.
+ci: check bench-check smoke
+
 clean:
-	rm -rf dist docs/api node_modules
+	rm -rf dist docs/api node_modules _site tmp
+
+# Writes tmp/lcov.info (uploaded to Codecov from the ubuntu lane) alongside the JUnit XML.
+coverage:
+	npm run test:coverage
 
 # Regenerates the HTML API reference into docs/api (gitignored — published, not committed).
 docs:
@@ -31,9 +54,14 @@ format:
 help:
 	@echo "Usage: make <target> [LEVEL=patch|minor|major]"
 	@echo ""
+	@echo "  bench         Run every benchmark and print the table (no gate)"
+	@echo "  bench-check   Compare benchmarks against benches/results.json (the CI gate)"
+	@echo "  bench-update  Re-record the benchmark baseline"
 	@echo "  build         Compile lib/ + mod.ts to dist/ (ESM + .d.ts + maps)"
 	@echo "  check         Everything CI runs: format, lint, doc gates, tests on both runtimes"
-	@echo "  clean         Remove dist/, docs/api/ and node_modules/"
+	@echo "  ci            check + bench-check + smoke — the full CI surface, locally"
+	@echo "  clean         Remove dist/, docs/api/, _site/, tmp/ and node_modules/"
+	@echo "  coverage      Run the suite with coverage → tmp/lcov.info + tmp/junit-node.xml"
 	@echo "  docs          Generate the HTML API reference into docs/api"
 	@echo "  fix           Auto-fix formatting (alias: fmt)"
 	@echo "  format        Check formatting (prettier)"

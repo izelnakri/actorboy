@@ -2,77 +2,258 @@ name: CI
 
 on:
   push:
-    branches: [main]
-    tags: ['v*']
   pull_request:
+    branches: [main]
+  workflow_dispatch:
 
+permissions:
+  contents: read
+
+# Cancel stale in-progress runs when a PR is pushed again. Main-branch runs are
+# preserved (they publish releases and deploy Pages), so the cancel is gated on
+# event_name == pull_request. The group key includes ref so unrelated PRs don't
+# compete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# `if: !DUPLICATE_PR_EVENT` (inlined per job below): same-repo PRs fire BOTH
+# `push` and `pull_request` for the same SHA; skip the pull_request leg since
+# push already covers it. Forks still run via pull_request because pushes from
+# forks don't fire here. Applied to lint / test / test-deno / package / bench —
+# every other job already filters on `refs/heads/main` or `refs/tags/v*`.
 jobs:
+  # ── Static gates + the doc contract ───────────────────────────────────────────
+  # Everything that needs neither a matrix nor a second runtime, ordered so the
+  # cheapest gate fails first.
   lint:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version-file: package.json
           cache: npm
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-          # Warm DENO_DIR (keyed on the lockfile) so the type-check cache is reused across
-          # runs — the --doc gates below re-check doc blocks correctly on cached content.
+          # Warm DENO_DIR (keyed on deno.lock) so the deno checks below reuse the
+          # type-check cache across runs. Safe for the --doc gates: the check cache
+          # is content-keyed, so doc blocks are re-checked correctly on cached
+          # content (see scripts/lint-docs.js).
           cache: true
       - run: npm ci
       - run: npm run format
       - run: npm run lint
+      # Every reachable public symbol in lib/ must carry a runnable fenced example,
+      # and no example may opt out with an `ignore` fence. A canary self-test proves
+      # the gate can still fail.
       - run: npm run lint:docs
       # Rust-style doctests, both halves: `typecheck` TYPE-CHECKS every JSDoc example
-      # (deno check --doc); `test:doctest` RUNS them under a sandbox allowing only env reads,
-      # /tmp reads and read-only system metadata — an example that writes, connects or spawns
-      # fails loudly.
+      # (deno check --doc); `test:doctest` RUNS them under a sandbox allowing only env
+      # reads, /tmp reads and read-only system metadata — an example that writes,
+      # connects or spawns fails loudly.
       - run: npm run typecheck
       - run: npm run test:doctest
-      # Promises/A+ compliance for lib/task — 872 tests, ~13s, cheaper here than in the matrix.
+      - run: deno check 'benches/**/*.ts' 'scripts/**/*.ts'
+      # Promises/A+ compliance for lib/task — 872 tests, ~13s, cheaper here than in
+      # the OS matrix.
       - run: npm run test:aplus
 
+  # ── The suite, per OS, under Node ─────────────────────────────────────────────
   test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version-file: package.json
+          cache: npm
+      - run: npm ci
+      # Coverage is collected on ubuntu only: the other two lanes exist to catch
+      # platform-specific behaviour (path separators, worker-thread startup, socket
+      # teardown), not to re-measure the same lines.
+      - run: npm run test:coverage
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          FORCE_COLOR: 0
+      - run: npm run test:junit
+        if: matrix.os != 'ubuntu-latest'
+        env:
+          FORCE_COLOR: 0
+      - uses: codecov/codecov-action@v7
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          files: tmp/lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+      # Picked up by test-report.yml's workflow_run trigger, which renders PR
+      # annotations and per-platform check runs via dorny/test-reporter.
+      # Always-upload so failures get reported too.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: junit-${{ matrix.os }}
+          path: tmp/junit-*.xml
+          retention-days: 3
+          if-no-files-found: ignore
+
+  # ── The same suite, per OS, under Deno ────────────────────────────────────────
+  # Not a duplicate of `test`: this library's whole claim is that it runs unchanged
+  # on Node, Deno and in a browser, so the Deno lane is a correctness gate, not a
+  # nicety. Different GC, different timer implementation, different node: compat
+  # shims — the ws transport, the worker-thread paths and the diagnostics_channel
+  # seam all resolve differently here.
+  test-deno:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork
+    name: test-deno (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: package.json
+          cache: npm
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      # npm ci, not `deno install`: the suite imports `ws` and `qunitx` out of
+      # node_modules through deno's `nodeModulesDir: auto`.
+      - run: npm ci
+      - run: npm run test:deno:junit
+        env:
+          FORCE_COLOR: 0
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: junit-deno-${{ matrix.os }}
+          path: tmp/junit-*.xml
+          retention-days: 3
+          if-no-files-found: ignore
+
+  # ── The consumer's view ──────────────────────────────────────────────────────
+  # The npm artifact is the thing consumers actually load. Build it, pack the
+  # tarball, install it into a throwaway project, then import every entry point of
+  # the exports map from OUTSIDE the package — the one thing the in-repo suites
+  # structurally cannot check, because they import `lib/**/*.ts` directly and never
+  # see dist/, the exports map, or the `.ts`→`.js` specifier rewrite.
+  package:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: package.json
           cache: npm
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
       - run: npm ci
-      - run: npm test
-      - run: npm run test:deno
-      # The npm artifact is the thing consumers actually load: build it, then import every
-      # entry point through the exports map from outside the package.
       - run: npm run build
       - run: node scripts/smoke-package.js
+      # JSR publishes the TypeScript as-is and rejects slow types; --dry-run is the
+      # only way to learn that before the tag exists.
+      - run: deno publish --dry-run --allow-dirty
 
-  publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+  # ── Performance regression gate ──────────────────────────────────────────────
+  # The claim under test is "a Result costs nothing on the success path". Benches
+  # run in isolated subprocesses (one per file) so GC pressure in one group cannot
+  # inflate another's latencies; scripts/check-benchmarks.ts compares against the
+  # committed baseline in benches/results.json.
+  bench:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: package.json
+          cache: npm
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      - run: npm ci
+      - run: deno task bench:check
+        env:
+          FORCE_COLOR: 0
+
+  # ── Pages (main only) ────────────────────────────────────────────────────────
+  # Deploys the generated API reference (deno doc --html) to GitHub Pages.
+  # Concurrency guard cancels any stale in-flight deployment.
+  pages:
+    if: github.ref == 'refs/heads/main'
     needs: [lint, test]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: pages
+      cancel-in-progress: true
     permissions:
       contents: read
-      id-token: write # npm provenance + JSR OIDC — no tokens for the JSR half
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version-file: package.json
+          cache: npm
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: npm ci
+      - run: npm run docs
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp -r docs/api/. _site/
+          touch _site/.nojekyll
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v5
+
+  # ── Publish (tags only) ──────────────────────────────────────────────────────
+  # One source tree, two registries: npm gets the tsc-compiled dist/ with
+  # provenance, JSR gets the TypeScript as-is. `id-token: write` is what makes npm
+  # provenance and the JSR half tokenless.
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, test, test-deno, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: package.json
           registry-url: https://registry.npmjs.org
           cache: npm
       - uses: denoland/setup-deno@v2
@@ -83,3 +264,25 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - run: deno publish
+
+  # ── GitHub release (tags only) ───────────────────────────────────────────────
+  # Creates the release entry from the matching CHANGELOG.md section, so the body
+  # matches the rich changelog `make release` already committed.
+  #
+  # Intentionally NOT gated on `publish`: by the time this runs, `make release` has
+  # already pushed to both registries, so blocking the GitHub release on a flaky
+  # job causes drift (the registries have it, GitHub doesn't). release-reconcile.yml
+  # is the weekly backstop for any other publish failure.
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/publish-release
+        with:
+          tag: ${{ github.ref_name }}
+          github_token: ${{ github.token }}
