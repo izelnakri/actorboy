@@ -24,9 +24,12 @@ const npmRun = (args, cwd) =>
 
 // The consumer: one import per entry point, then a live exercise of each leg. `ws` is absent
 // here on purpose — `actorboy/node/hub` is the only entry that needs it, and leaving it
-// out proves the other seven stay installable with zero dependencies.
+// out proves every other entry point stays installable with zero dependencies.
 const CONSUMER = `
-import { Result, Task, Stream, Supervisor, Node, Failure, PubSub, Presence, Telemetry, Raft } from 'actorboy';
+import {
+  Result, Task, Stream, Supervisor, Node, Failure,
+  PubSub, Presence, Telemetry, Raft, Jobs, Saga, Cache, Logger,
+} from 'actorboy';
 import * as ResultEntry from 'actorboy/result';
 import * as FailureEntry from 'actorboy/failure';
 import { Task as TaskEntry } from 'actorboy/task';
@@ -37,6 +40,10 @@ import * as PubSubEntry from 'actorboy/pubsub';
 import * as PresenceEntry from 'actorboy/presence';
 import * as TelemetryEntry from 'actorboy/telemetry';
 import * as RaftEntry from 'actorboy/raft';
+import * as JobsEntry from 'actorboy/jobs';
+import * as SagaEntry from 'actorboy/saga';
+import * as CacheEntry from 'actorboy/cache';
+import * as LoggerEntry from 'actorboy/logger';
 import assert from 'node:assert';
 
 const NotFound = Failure.define('NotFound', (d) => \`no user \${d.id}\`);
@@ -58,7 +65,7 @@ const b = Node.start('b@memory', hub.transport());
 b.handle('echo', (x) => x);
 assert.equal(await a.call('b@memory', 'echo', 7, 1000), 7);
 
-// The three cluster services, each exercised through the barrel it ships behind.
+// The cluster services, each exercised through the barrel it ships behind.
 const bus = PubSub.pubsub(a);
 const heard = [];
 bus.subscribe('rooms:lobby', (event, payload) => heard.push(\`\${event}:\${payload}\`));
@@ -90,6 +97,10 @@ assert.equal(PubSubEntry.pubsub, PubSub.pubsub);
 assert.equal(PresenceEntry.presence, Presence.presence);
 assert.equal(TelemetryEntry.execute, Telemetry.execute);
 assert.equal(RaftEntry.raft, Raft.raft);
+assert.equal(JobsEntry.jobQueue, Jobs.jobQueue);
+assert.equal(SagaEntry.saga, Saga.saga);
+assert.equal(CacheEntry.distributedCache, Cache.distributedCache);
+assert.equal(LoggerEntry.logger, Logger.logger);
 
 console.log('smoke-package: OK');
 `;

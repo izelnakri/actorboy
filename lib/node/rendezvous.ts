@@ -13,21 +13,48 @@
  * pairing it with a registry (publish the winner) makes cold-start races impossible: everyone
  * routes "create X" to the same node.
  *
+ * Pass `weightOf` for **weighted** rendezvous — a node's expected share of the keyspace scales
+ * with its weight, so heavier nodes hold proportionally more keys (heterogeneous capacity) and a
+ * caller can bias placement toward its own **zone** for locality (boost same-zone nodes) — all
+ * while keeping HRW's minimal-movement guarantee. The math is the standard weighted-HRW score
+ * `weight × −1/ln(u)`, `u ∈ (0,1)` from the hash; a weight ≤ 0 opts a node out.
+ *
  * ```ts
  * const owner = rendezvous('room:lobby', ['a@n', 'b@n', 'c@n']);
  * typeof owner; // 'string' — the same node for this key on every caller
  * rendezvous('anything', []); // null — no nodes
+ *
+ * // Zone-aware: nodes in 'eu' are twice as likely to own a key as 'us' ones.
+ * const zone: Record<string, number> = { 'a@eu': 2, 'b@eu': 2, 'c@us': 1 };
+ * const placed = rendezvous('cart:9', Object.keys(zone), (n) => zone[n]);
+ * typeof placed; // 'string'
  * ```
  */
-export function rendezvous(key: string, nodes: readonly string[]): string | null {
+export function rendezvous(
+  key: string,
+  nodes: readonly string[],
+  weightOf?: (node: string) => number,
+): string | null {
   let best: string | null = null;
-  let bestScore = -1;
+  let bestScore = -Infinity;
   for (const node of nodes) {
-    // NUL as the separator, written as an escape rather than a literal byte: it cannot occur
-    // in a key or a node name, so `("a", "b/c")` and `("a/b", "c")` can never hash alike — and
-    // a source file with a raw control character in it is one that git calls binary and grep
-    // refuses to search.
-    const score = weigh(`${key}\0${node}`);
+    const hashed = weigh(
+      // NUL as the separator, written as an escape rather than a literal byte: it cannot
+      // occur in a key or a node name, so `("a", "b/c")` and `("a/b", "c")` can never hash
+      // alike — and a source file with a raw control character in it is one that git calls
+      // binary and grep refuses to search.
+      `${key}\0${node}`,
+    );
+    let score: number;
+    if (weightOf) {
+      const weight = weightOf(node);
+      if (weight <= 0) continue; // weight <= 0 opts the node out of ownership
+      // u in (0,1); the standard weighted-HRW score. Equal weights fall back to raw hash order.
+      const u = (hashed + 1) / 4294967297; // (hash+1)/(2^32+1) keeps u strictly inside (0,1)
+      score = weight * (-1 / Math.log(u));
+    } else {
+      score = hashed;
+    }
     if (score > bestScore) {
       bestScore = score;
       best = node;
