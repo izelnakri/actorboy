@@ -115,7 +115,7 @@
     }
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
+    "@types/node": "^26.1.2",
     "@types/ws": "^8.18.1",
     "prettier": "^3.9.5",
     "promises-aplus-tests": "^2.1.2",
