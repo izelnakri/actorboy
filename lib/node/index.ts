@@ -1,9 +1,10 @@
 // Barrel for the Node leg: import * as Node from '.../lib/node/index.ts'.
-// Elixir's Node module, JS-shaped: Node.start(name, transport), Node.memoryHub(),
-// Node.fromPort(worker). Message passing (call/cast/handle) replaces remote spawns —
-// JS cannot ship closures — and the Failure envelope codec keeps channel identity across
-// every hop: declared failures arrive declared, never as clone-gutted Errors.
+// Elixir's Node module, JS-shaped: Node.start(name, transport), Node.memoryHub(), Node.fromPort(worker).
+// (`Node.start` also ships as a named `Node` namespace for `import { Node }` callers.) Message passing
+// (call/cast/handle) replaces remote spawns — JS cannot ship closures — and the Failure envelope codec
+// keeps channel identity across every hop: declared failures arrive declared, never clone-gutted.
 export {
+  Node,
   start,
   heartbeat,
   memoryHub,
@@ -63,7 +64,22 @@ export { ORSet, type Dot, type VersionVector, type CausalContext, type CrdtState
 // Hot code upgrades: Erlang's release mechanics on web standards — import() as the code
 // server, run-to-completion as suspend/resume, codeChange as code_change/3, and the
 // `<name>.sys.upgrade` subject as the relup that reaches remote nodes.
-export { serve, memoryStore, type Behavior, type Served, type Store } from './upgradable.ts';
+export { memoryStore, type Store } from './store.ts';
+export {
+  genServer,
+  spawnProcess,
+  superviseGenServer,
+  type Behavior,
+  type GenServer,
+  type GenServerOptions,
+  type Pid,
+  type Self,
+  type TimerRef,
+} from './gen-server.ts';
+
+// Elixir's Process module — the static side: Process.spawn (anonymous units) + free-function
+// link/exit/alive/whereis. Per-unit ops live on the handle and the `self` a handler gets.
+export { Process, type BoundProcess } from './process.ts';
 export {
   supervisor,
   type Supervisor,

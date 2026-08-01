@@ -34,9 +34,10 @@
  * log; // ['reserve', 'charge', 'release-seat'] — the reserved seat was compensated back
  * ```
  */
-import { isFailure, type Any as AnyFailure } from '../result/failure.ts';
+import { Failure } from '../result/index.ts';
+import type { Any as AnyFailure } from '../result/failure.ts';
 import { Task } from '../task/task.ts';
-import type { Store } from '../node/upgradable.ts';
+import type { Store } from '../node/store.ts';
 
 /** One saga step: a forward action, its compensation, and an optional retry count. */
 export interface Step<Ctx extends object> {
@@ -154,7 +155,7 @@ export function saga<Ctx extends object>(
         return {
           ok: false,
           failedAt: progress.completed.at(-1)!.name,
-          error: isFailure(progress) ? progress : new Error('recovered after crash'),
+          error: Failure.is(progress) ? progress : new Error('recovered after crash'),
           compensated,
         };
       }).perform();

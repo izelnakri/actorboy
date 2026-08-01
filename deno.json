@@ -16,7 +16,7 @@
     "./presence": "./lib/presence/index.ts",
     "./telemetry": "./lib/telemetry/index.ts",
     "./raft": "./lib/raft/index.ts",
-    "./jobs": "./lib/jobs/index.ts",
+    "./job": "./lib/job/index.ts",
     "./saga": "./lib/saga/index.ts",
     "./cache": "./lib/cache/index.ts",
     "./logger": "./lib/logger/index.ts"

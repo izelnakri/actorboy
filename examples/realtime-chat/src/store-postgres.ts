@@ -2,7 +2,7 @@
 // jobs. Lives in the example (not lib) because `postgres` is an app dependency; lib defines the
 // Store seam, apps bring the backend. Every host in the cluster shares ONE of these (a shared DB),
 // which is what lets a room rehydrate on a NEW host after its old one died — and lets every node
-// run the same jobQueue, coordinated by the DB (claim = SKIP LOCKED, lease = a leases row).
+// run the same Job.queue, coordinated by the DB (claim = SKIP LOCKED, lease = a leases row).
 //
 // Schema:
 //   CREATE TABLE room_state (key text PRIMARY KEY, state jsonb NOT NULL,
@@ -12,7 +12,7 @@
 //   -- helps the claim's ordered SKIP LOCKED scan under load:
 //   CREATE INDEX room_state_jobs ON room_state ((state->>'queue'), (state->>'state'));
 //
-// Persist-before-ack (serve()'s durability) means each mutating message does one UPSERT here
+// Persist-before-ack (genServer()'s durability) means each mutating message does one UPSERT here
 // before the caller is acked — so a "sent" message is on disk. That is the delta-loss fix: the
 // snapshot IS the latest committed state, written synchronously, not a periodic checkpoint.
 import postgres from 'postgres';
@@ -29,9 +29,7 @@ export function postgresStore(databaseUrl: string): Store {
     },
     async save(key, state) {
       await sql`
-        INSERT INTO room_state (key, state) VALUES (${key}, ${sql.json(
-          state as Parameters<typeof sql.json>[0],
-        )})
+        INSERT INTO room_state (key, state) VALUES (${key}, ${sql.json(state as Parameters<typeof sql.json>[0])})
         ON CONFLICT (key) DO UPDATE SET state = EXCLUDED.state, updated_at = now()
       `;
     },

@@ -165,16 +165,26 @@ Erlang's release mechanics on web standards: `import()` is the code server, run-
 is suspend/resume, and `codeChange` is `code_change/3`.
 
 ```ts
-const served = Node.serve(node, 'counter', behaviorV1);
+const counter = Node.genServer(node, 'counter', behaviorV1);
 await client.call('counter@ws', 'counter.sys.upgrade', { url: './counter-v2.ts' });
 ```
 
 See [docs/hot-code-upgrades.md](docs/hot-code-upgrades.md).
 
-A served unit has a real mailbox (messages serialize per unit, `gen_server`-style), links and
-`trapExit` for Erlang's exit signals, an optional `Store` seam for persist-before-ack
-durability, `maxMailbox` load shedding, and an observer protocol for `:dbg`-style frame
-tracing.
+### The unit — `genServer` and `Process`
+
+`genServer(node, name, behavior)` is OTP's `gen_server`: a named, stateful unit with a real
+mailbox (messages serialize per unit, async handlers included), links and `trapExit` for Erlang's
+exit signals, an optional `Store` seam for persist-before-ack durability, `maxMailbox` load
+shedding, an observer protocol for `:dbg`-style frame tracing, and `crashOnError` for OTP's
+let-it-crash. Handlers receive a `self` context — `self.name`, `self.from`, `self.deadline`,
+`self.trace`, and the self-operations `link` / `exit` / `send_after`.
+
+`Process` is Erlang's `Process` module: `Process.spawn(node, behavior)` starts an **anonymous**
+unit addressed by handle rather than by name (including `spawn` of a bare function),
+`Process.link` / `exit` / `alive` / `whereis` / `list`, and `Process.of(node)` for a node-bound
+namespace. `superviseGenServer` wraps a unit as a supervisable `Service`, which is what lets a
+`distributedSupervisor` child be a gen_server that survives its host.
 
 ## PubSub, Presence, Telemetry
 
@@ -234,11 +244,11 @@ every key — and because claims serialize through that coordinator, it restores
 ## Jobs, Sagas, Cache, Logger
 
 ```ts
-import { jobQueue, leader } from 'actorboy/jobs';
+import { Job, leader } from 'actorboy/job';
 import { saga } from 'actorboy/saga';
 ```
 
-`jobQueue` is Oban: jobs persist through the `Store` seam **before** `insert` resolves, run under
+`Job.queue` is Oban: jobs persist through the `Store` seam **before** `insert` resolves, run under
 per-queue concurrency limits, retry with backoff to `maxAttempts` (then stay as `discarded`, with
 their errors), and are rescued after a crash. Distributed by default — every node drains the same
 store and the atomic `Store.claim` (`SKIP LOCKED`, in the Postgres case) partitions the work, so

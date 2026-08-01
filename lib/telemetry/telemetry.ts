@@ -6,7 +6,7 @@
  * Emitter and observer never know about each other, so a Node, a Supervisor, or a room actor can
  * be instrumented and a metrics/tracing sink wired up entirely separately.
  *
- * An event name is a list of segments — Elixir's list of atoms, e.g. `['qunitx', 'node', 'call']`.
+ * An event name is a list of segments — Elixir's list of atoms, e.g. `['actorboy', 'node', 'call']`.
  * Handlers attach to an EXACT event; `span` brackets an operation with `…:start` / `…:stop` (or
  * `…:exception`) events carrying a measured `duration`, the shape a tracing backend consumes.
  *

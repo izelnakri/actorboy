@@ -28,7 +28,7 @@ const npmRun = (args, cwd) =>
 const CONSUMER = `
 import {
   Result, Task, Stream, Supervisor, Node, Failure,
-  PubSub, Presence, Telemetry, Raft, Jobs, Saga, Cache, Logger,
+  PubSub, Presence, Telemetry, Raft, Job, Saga, Cache, Logger,
 } from 'actorboy';
 import * as ResultEntry from 'actorboy/result';
 import * as FailureEntry from 'actorboy/failure';
@@ -40,7 +40,7 @@ import * as PubSubEntry from 'actorboy/pubsub';
 import * as PresenceEntry from 'actorboy/presence';
 import * as TelemetryEntry from 'actorboy/telemetry';
 import * as RaftEntry from 'actorboy/raft';
-import * as JobsEntry from 'actorboy/jobs';
+import { Job as JobEntry } from 'actorboy/job';
 import * as SagaEntry from 'actorboy/saga';
 import * as CacheEntry from 'actorboy/cache';
 import * as LoggerEntry from 'actorboy/logger';
@@ -97,7 +97,7 @@ assert.equal(PubSubEntry.pubsub, PubSub.pubsub);
 assert.equal(PresenceEntry.presence, Presence.presence);
 assert.equal(TelemetryEntry.execute, Telemetry.execute);
 assert.equal(RaftEntry.raft, Raft.raft);
-assert.equal(JobsEntry.jobQueue, Jobs.jobQueue);
+assert.equal(JobEntry.queue, Job.queue);
 assert.equal(SagaEntry.saga, Saga.saga);
 assert.equal(CacheEntry.distributedCache, Cache.distributedCache);
 assert.equal(LoggerEntry.logger, Logger.logger);

@@ -1,6 +1,6 @@
 import { module, test } from 'qunitx';
-import { start, memoryHub } from '../../lib/node/index.ts';
-import { jobQueue, raftStore } from '../../lib/jobs/index.ts';
+import { Node, memoryHub } from '../../lib/node/index.ts';
+import { Job, raftStore } from '../../lib/job/index.ts';
 
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const until = async (cond: () => boolean, ms = 5000) => {
@@ -15,8 +15,8 @@ const until = async (cond: () => boolean, ms = 5000) => {
 module('Jobs | raftStore (external-DB-free distributed store)', () => {
   test('two nodes drain ONE Raft-backed store: work splits, nothing runs twice', async (assert) => {
     const hub = memoryHub();
-    const nodeA = start('a@rs', hub.transport());
-    const nodeB = start('b@rs', hub.transport());
+    const nodeA = Node.start('a@rs', hub.transport());
+    const nodeB = Node.start('b@rs', hub.transport());
     const opts = {
       peers: ['a@rs', 'b@rs'],
       heartbeatMs: 15,
@@ -34,7 +34,7 @@ module('Jobs | raftStore (external-DB-free distributed store)', () => {
 
     const runByNode: Record<string, string> = {}; // jobId -> node, or 'DUP' if two ran it
     const makeQueue = (store: typeof storeA, tag: string) =>
-      jobQueue({
+      Job.queue({
         store,
         pollMs: 20,
         queues: { default: 2 }, // each node runs at most 2 at once — neither can take all 8

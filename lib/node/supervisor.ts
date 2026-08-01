@@ -2,7 +2,7 @@
 // reverse, and restarted on abnormal exit per a strategy. It is universal (no node: APIs) — a child
 // is any value with an optional `stop()`, and, to be auto-restarted, an `onExit(handler)` seam it
 // calls when it dies abnormally (a graceful `stop()` must NOT fire it). Store-backed services
-// (jobQueue) restart cleanly because their state is durable — the new instance re-reads it, exactly
+// (Job.queue) restart cleanly because their state is durable — the new instance re-reads it, exactly
 // OTP's "rebuild from persisted state". Address children through {@link Supervisor.get} (not a
 // captured reference) so a lookup always resolves the CURRENT instance after a restart.
 //
@@ -21,7 +21,7 @@
 // BUILDING A SUPERVISABLE SERVICE: expose `stop()` (graceful teardown — it must NOT trigger
 // `onExit`), and, IF the service can die as a unit, `onExit(handler)` — store the handler and call
 // it with a reason on abnormal death so the supervisor can restart it. Omit `onExit` only for a
-// service that self-heals (a jobQueue retries its own jobs) or can't crash as a unit — then use
+// service that self-heals (a Job.queue retries its own jobs) or can't crash as a unit — then use
 // `restart: 'temporary'`. Keep each service's state durable (a Store) or private — never shared
 // mutable memory across siblings, which a restart cannot heal.
 
@@ -32,9 +32,9 @@ export type Restart = 'permanent' | 'transient' | 'temporary';
 /** A supervised value. `stop` is graceful teardown; `onExit` (optional) lets the child report an
  *  ABNORMAL exit so the supervisor can restart it — a graceful `stop()` must not trigger it. */
 export interface Service {
-  /** Graceful teardown. Must NOT fire `onExit` — a planned stop is not a crash. */
+  /** Graceful teardown — must NOT trigger `onExit`. */
   stop?(): void | Promise<void>;
-  /** Report an ABNORMAL exit, so the supervisor can apply this child's restart policy. */
+  /** Report an ABNORMAL exit so the supervisor can restart the child. */
   onExit?(handler: (reason?: unknown) => void): void;
 }
 
@@ -44,11 +44,11 @@ export type Strategy = 'one_for_one' | 'rest_for_one' | 'one_for_all';
 /** One child: a `name`, a `start` (given a `get` to look up already-started siblings), and an
  *  optional {@link Restart} policy. */
 export interface ChildSpec<S = unknown> {
-  /** How siblings and `Supervisor#get` address this child. */
+  /** Unique name — used for `get` lookups and restart identity. */
   name: string;
-  /** Builds the child. `get` looks up an already-started sibling, so order expresses dependency. */
+  /** Boot the child; `get` looks up already-started siblings for dependency wiring. */
   start: (get: <T = unknown>(name: string) => T) => S | Promise<S>;
-  /** When to restart it — see {@link Restart}. Defaults to `permanent`. */
+  /** When to restart it (default `permanent`) — see {@link Restart}. */
   restart?: Restart;
 }
 

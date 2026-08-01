@@ -1,24 +1,36 @@
 // A workerPool worker exercising the four Task-in-handler patterns. In test/fixtures (lint/check
-// excluded). `ran` is worker-LOCAL — the main thread reads it back via the 'ran' handler, because a
-// side effect on a worker thread isn't visible across the postMessage boundary.
-import { serveWorker } from '../../lib/node/worker-pool.ts';
+// excluded). Pure: it `export`s a `worker` setup; the pool's bootstrap hands it to serveWorker().
+// `ran` is worker-LOCAL — the main thread reads it back via the 'ran' handler, because a side effect
+// on a worker thread isn't visible across the postMessage boundary.
 import { Task } from '../../lib/task/index.ts';
+import type { NodeHandle } from '../../lib/node/node.ts';
 
-let ran = 0;
-
-serveWorker((node) => {
+export function worker(node: NodeHandle) {
+  let ran = 0;
   node.handle('ran', () => ran);
   node.handle('reset', () => void (ran = 0));
 
-  // return task
-  node.handle('return-task', () => Task(() => ((ran += 1), 'v')));
+  // (e/i) return task
+  node.handle('return-task', () =>
+    Task(() => {
+      ran += 1;
+      return 'v';
+    }),
+  );
   node.handle('return-task-bad', () =>
     Task(() => {
       throw new Error('boom');
     }),
   );
-  // return await task
-  node.handle('return-await', async () => await Task(() => ((ran += 1), 'v')));
+  // (f/j) return await task
+  node.handle(
+    'return-await',
+    async () =>
+      await Task(() => {
+        ran += 1;
+        return 'v';
+      }),
+  );
   node.handle(
     'return-await-bad',
     async () =>
@@ -26,20 +38,24 @@ serveWorker((node) => {
         throw new Error('boom');
       }),
   );
-  // { task; return x } — created, never awaited (lazy → dropped)
-  node.handle('drop-lazy', () => (Task(() => (ran += 1)), 'x'));
-  node.handle(
-    'drop-lazy-bad',
-    () => (
-      Task(() => {
-        throw new Error('boom');
-      }),
-      'x'
-    ),
-  );
-  // { await task; return x }
+  // (g/k) { task; return x } — created, never awaited (lazy → dropped)
+  node.handle('drop-lazy', () => {
+    Task(() => {
+      ran += 1;
+    });
+    return 'x';
+  });
+  node.handle('drop-lazy-bad', () => {
+    Task(() => {
+      throw new Error('boom');
+    });
+    return 'x';
+  });
+  // (h/l) { await task; return x }
   node.handle('await-task', async () => {
-    await Task(() => (ran += 1));
+    await Task(() => {
+      ran += 1;
+    });
     return 'x';
   });
   node.handle('await-task-bad', async () => {
@@ -48,4 +64,4 @@ serveWorker((node) => {
     });
     return 'x';
   });
-});
+}
