@@ -152,6 +152,13 @@ under gossip lag, so a losing node is told via `onConflict` and tears down what 
 `rendezvous(key, nodes)` picks the same owner on every caller without any coordination at all
 (HRW hashing: a join or a leave moves ~1/N of keys, not all of them).
 
+Membership and the registry are backed by a **delta-state CRDT** (an ORSWOT with a dot-cloud
+causal context), gossiped as deltas and reconciled by periodic anti-entropy. Convergence does
+not depend on any frame arriving: the chaos suite drops 40% of them and the cluster still
+agrees. `monitorNodes` reports both directions — `nodeup` as well as `nodedown` — so work that
+follows membership (rebalancing a key range onto a joining host, warming a cache) can react to
+scale-**up**, not only to loss.
+
 ### Hot code upgrades
 
 Erlang's release mechanics on web standards: `import()` is the code server, run-to-completion
