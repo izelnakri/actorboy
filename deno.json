@@ -28,6 +28,14 @@
   "compilerOptions": {
     "lib": ["deno.ns", "esnext", "dom", "dom.iterable"]
   },
+  // Benchmarks are a deno-only surface (`Deno.bench`), so they live as tasks rather than npm
+  // scripts. `bench:check` runs each file in its own subprocess and compares against the
+  // committed baseline in benches/results.json — see scripts/check-benchmarks.ts.
+  "tasks": {
+    "bench": "deno bench --allow-all benches/result.bench.ts benches/task.bench.ts benches/stream.bench.ts benches/node.bench.ts",
+    "bench:check": "deno run --allow-all scripts/check-benchmarks.ts --files benches/result.bench.ts benches/task.bench.ts benches/stream.bench.ts benches/node.bench.ts",
+    "bench:update": "deno run --allow-all scripts/check-benchmarks.ts --save --files benches/result.bench.ts benches/task.bench.ts benches/stream.bench.ts benches/node.bench.ts"
+  },
   "lint": {
     "rules": {
       "exclude": ["no-process-global", "no-node-globals", "no-window"]
