@@ -64,6 +64,18 @@
       "types": "./dist/lib/node/hub.d.ts",
       "default": "./dist/lib/node/hub.js"
     },
+    "./pubsub": {
+      "types": "./dist/lib/pubsub/index.d.ts",
+      "default": "./dist/lib/pubsub/index.js"
+    },
+    "./presence": {
+      "types": "./dist/lib/presence/index.d.ts",
+      "default": "./dist/lib/presence/index.js"
+    },
+    "./telemetry": {
+      "types": "./dist/lib/telemetry/index.d.ts",
+      "default": "./dist/lib/telemetry/index.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [

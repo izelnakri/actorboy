@@ -82,3 +82,47 @@ export * as Supervisor from './lib/supervisor/index.ts';
  * ```
  */
 export * as Node from './lib/node/index.ts';
+
+/**
+ * Phoenix.PubSub — cluster-wide topic pub/sub over the CRDT-backed process groups, exactly as
+ * Phoenix builds its own on `pg`. `reliablePubSub` is the at-least-once variant.
+ *
+ * ```ts
+ * import { Node, PubSub } from './mod.ts';
+ * const hub = Node.memoryHub();
+ * const node = Node.start('a@memory', hub.transport());
+ * const bus = PubSub.pubsub(node);
+ * bus.subscribe('rooms:lobby', (event, payload) => [event, payload]);
+ * bus.broadcast('rooms:lobby', 'message', 'hello');
+ * node.stop();
+ * ```
+ */
+export * as PubSub from './lib/pubsub/index.ts';
+
+/**
+ * Phoenix.Presence — who is present on a topic, across the cluster, converging without
+ * coordination because it is the same ORSWOT the membership layer already runs under frame loss.
+ *
+ * ```ts
+ * import { Node, Presence } from './mod.ts';
+ * const hub = Node.memoryHub();
+ * const node = Node.start('a@memory', hub.transport());
+ * const tracker = Presence.presence(node);
+ * tracker.track('rooms:lobby', 'user:1', { name: 'ada' });
+ * node.stop();
+ * ```
+ */
+export * as Presence from './lib/presence/index.ts';
+
+/**
+ * Elixir's `:telemetry` — the instrumentation bus. Emitters `execute` named events; sinks
+ * `attach` handlers. The two never know about each other, which is the whole point.
+ *
+ * ```ts
+ * import { Telemetry } from './mod.ts';
+ * Telemetry.attach('log', ['app', 'request'], (_event, measurements) => measurements);
+ * Telemetry.execute(['app', 'request'], { durationMs: 12 });
+ * Telemetry.detach('log');
+ * ```
+ */
+export * as Telemetry from './lib/telemetry/index.ts';

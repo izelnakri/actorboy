@@ -9,6 +9,7 @@ export {
   memoryHub,
   fromPort,
   type Frame,
+  type Trace,
   type Transport,
   type NodeHandle,
 } from './node.ts';
@@ -22,6 +23,33 @@ export { wsTransport, traceTransport, binaryCodec, jsonCodec, type Codec } from 
 // Rendezvous (HRW) hashing: pick THE owner of a key with minimal reshuffling on membership
 // change — the routing primitive for distributed stateful entities (see examples/realtime-chat).
 export { rendezvous } from './rendezvous.ts';
+
+// Circuit breaker (Erlang :fuse / Akka): fail fast past a flaky peer and let it recover.
+export { circuitBreaker, type CircuitBreaker, type CircuitState } from './circuit-breaker.ts';
+
+// Token-bucket rate limiter: throttle work to a sustained rate + burst — the third load-protection
+// leg alongside GenStage backpressure and the circuit breaker.
+export { rateLimiter, type RateLimiter } from './rate-limiter.ts';
+
+// Automatic cluster formation (Elixir libcluster): a polling strategy discovers peers and the
+// manager diffs it against the connected set to converge the topology.
+export { cluster, type Cluster } from './cluster.ts';
+
+// Mesh transport: talk peer-to-peer instead of through the relay hub — retires the hub SPOF.
+// Universal routing core over an injected per-peer link factory; meshNetwork is the in-process test rig.
+export { meshTransport, meshNetwork, type MeshLink } from './mesh.ts';
+
+// Convergent counters + LWW register map — riak_dt's emcntr/LWW family, for distributed
+// metrics, gauges, and settings that merge without coordination.
+export {
+  GCounter,
+  PNCounter,
+  LWWMap,
+  type GCounterState,
+  type PNCounterState,
+  type LWWEntry,
+  type LWWMapState,
+} from './counters.ts';
 
 // The delta-state OR-Set: the CRDT that makes membership/registry converge under frame loss
 // and partition heal (anti-entropy), the way Horde's registry does.

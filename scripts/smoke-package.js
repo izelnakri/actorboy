@@ -26,13 +26,16 @@ const npmRun = (args, cwd) =>
 // here on purpose — `actorboy/node/hub` is the only entry that needs it, and leaving it
 // out proves the other seven stay installable with zero dependencies.
 const CONSUMER = `
-import { Result, Task, Stream, Supervisor, Node, Failure } from 'actorboy';
+import { Result, Task, Stream, Supervisor, Node, Failure, PubSub, Presence, Telemetry } from 'actorboy';
 import * as ResultEntry from 'actorboy/result';
 import * as FailureEntry from 'actorboy/failure';
 import { Task as TaskEntry } from 'actorboy/task';
 import { Stream as StreamEntry } from 'actorboy/stream';
 import * as SupervisorEntry from 'actorboy/supervisor';
 import * as NodeEntry from 'actorboy/node';
+import * as PubSubEntry from 'actorboy/pubsub';
+import * as PresenceEntry from 'actorboy/presence';
+import * as TelemetryEntry from 'actorboy/telemetry';
 import assert from 'node:assert';
 
 const NotFound = Failure.define('NotFound', (d) => \`no user \${d.id}\`);
@@ -53,6 +56,25 @@ const a = Node.start('a@memory', hub.transport());
 const b = Node.start('b@memory', hub.transport());
 b.handle('echo', (x) => x);
 assert.equal(await a.call('b@memory', 'echo', 7, 1000), 7);
+
+// The three cluster services, each exercised through the barrel it ships behind.
+const bus = PubSub.pubsub(a);
+const heard = [];
+bus.subscribe('rooms:lobby', (event, payload) => heard.push(\`\${event}:\${payload}\`));
+bus.broadcast('rooms:lobby', 'message', 'hi');
+await new Promise((resolve) => setTimeout(resolve, 20));
+assert.deepEqual(heard, ['message:hi']);
+
+const tracker = Presence.presence(a);
+tracker.track('rooms:lobby', 'user:1', { name: 'ada' });
+assert.ok(tracker.list('rooms:lobby')['user:1']);
+
+const measured = [];
+Telemetry.attach('smoke', ['smoke', 'event'], (_event, measurements) => measured.push(measurements));
+Telemetry.execute(['smoke', 'event'], { durationMs: 1 });
+Telemetry.detach('smoke');
+assert.equal(measured.length, 1);
+
 a.stop();
 b.stop();
 
@@ -63,6 +85,9 @@ assert.equal(ResultEntry.unwrap, Result.unwrap);
 assert.equal(FailureEntry.define, Failure.define);
 assert.equal(SupervisorEntry.start, Supervisor.start);
 assert.equal(NodeEntry.start, Node.start);
+assert.equal(PubSubEntry.pubsub, PubSub.pubsub);
+assert.equal(PresenceEntry.presence, Presence.presence);
+assert.equal(TelemetryEntry.execute, Telemetry.execute);
 
 console.log('smoke-package: OK');
 `;
