@@ -126,3 +126,24 @@ export * as Presence from './lib/presence/index.ts';
  * ```
  */
 export * as Telemetry from './lib/telemetry/index.ts';
+
+/**
+ * CP consensus — a replicated log that commits only on a majority, Erlang `ra`'s role. The
+ * complement to the AP layer above it: a Raft group for the few decisions that must be
+ * linearizable, CRDTs for everything that should stay available under partition.
+ *
+ * ```ts
+ * import { Node, Raft } from './mod.ts';
+ * const hub = Node.memoryHub();
+ * const node = Node.start('a@raft', hub.transport());
+ * const group = Raft.raft(node, {
+ *   peers: ['a@raft', 'b@raft', 'c@raft'],
+ *   init: () => 0,
+ *   apply: (command, state: number) => ({ state: state + Number(command) }),
+ * });
+ * group.role(); // 'follower' — every member starts here; an election promotes one
+ * group.stop();
+ * node.stop();
+ * ```
+ */
+export * as Raft from './lib/raft/index.ts';

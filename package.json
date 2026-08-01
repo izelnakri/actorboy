@@ -76,6 +76,10 @@
       "types": "./dist/lib/telemetry/index.d.ts",
       "default": "./dist/lib/telemetry/index.js"
     },
+    "./raft": {
+      "types": "./dist/lib/raft/index.d.ts",
+      "default": "./dist/lib/raft/index.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [

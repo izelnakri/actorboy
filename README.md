@@ -205,6 +205,32 @@ fast past a peer that is already failing), `rateLimiter` (token bucket, sustaine
 burst), and the served unit's `maxMailbox`. `cluster()` is libcluster's polling formation:
 a strategy discovers peers, the manager diffs against the connected set and converges.
 
+## Raft — the CP half
+
+CRDTs stay available under partition by never needing agreement. Some decisions *do* need it:
+a lock, a lease, a unique sequence. `actorboy/raft` is a replicated log where a command commits
+only on a **majority** and applies in the same order everywhere, so a minority partition cannot
+decide anything — Erlang `ra`'s role, with pre-vote, read-index reads, leadership transfer, log
+compaction and membership change.
+
+```ts
+import * as Raft from 'actorboy/raft';
+
+const group = Raft.raft(node, {
+  peers: ['a@ws', 'b@ws', 'c@ws'],
+  init: () => ({ balance: 0 }),
+  apply: (command, state) => ({ state: applyCommand(state, command), reply: 'ok' }),
+});
+
+await group.submit({ deposit: 100 }); // resolves once a majority has the entry
+```
+
+Use a Raft group for the few things that must be linearizable and the AP layer for everything
+that should stay available. `shardedRegistry` sits between them: each key lives on one
+rendezvous-chosen coordinator, so memory scales with the cluster instead of every node holding
+every key — and because claims serialize through that coordinator, it restores Elixir's
+**synchronous** duplicate rejection, which the fully-replicated registry structurally cannot.
+
 ## Documentation
 
 - [docs/error-handling.md](docs/error-handling.md) — the full design argument: why the value is

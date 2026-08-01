@@ -26,7 +26,7 @@ const npmRun = (args, cwd) =>
 // here on purpose — `actorboy/node/hub` is the only entry that needs it, and leaving it
 // out proves the other seven stay installable with zero dependencies.
 const CONSUMER = `
-import { Result, Task, Stream, Supervisor, Node, Failure, PubSub, Presence, Telemetry } from 'actorboy';
+import { Result, Task, Stream, Supervisor, Node, Failure, PubSub, Presence, Telemetry, Raft } from 'actorboy';
 import * as ResultEntry from 'actorboy/result';
 import * as FailureEntry from 'actorboy/failure';
 import { Task as TaskEntry } from 'actorboy/task';
@@ -36,6 +36,7 @@ import * as NodeEntry from 'actorboy/node';
 import * as PubSubEntry from 'actorboy/pubsub';
 import * as PresenceEntry from 'actorboy/presence';
 import * as TelemetryEntry from 'actorboy/telemetry';
+import * as RaftEntry from 'actorboy/raft';
 import assert from 'node:assert';
 
 const NotFound = Failure.define('NotFound', (d) => \`no user \${d.id}\`);
@@ -88,6 +89,7 @@ assert.equal(NodeEntry.start, Node.start);
 assert.equal(PubSubEntry.pubsub, PubSub.pubsub);
 assert.equal(PresenceEntry.presence, Presence.presence);
 assert.equal(TelemetryEntry.execute, Telemetry.execute);
+assert.equal(RaftEntry.raft, Raft.raft);
 
 console.log('smoke-package: OK');
 `;
