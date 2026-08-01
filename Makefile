@@ -20,7 +20,7 @@ bench-check:
 bench-update:
 	deno task bench:update
 
-# Compiles lib/ + mod.ts to dist/ (ESM + .d.ts + maps). The `.ts` import specifiers in the
+# Compiles lib/ + mod.ts + cli.ts to dist/ (ESM + .d.ts + maps). The `.ts` import specifiers in the
 # source are rewritten to `.js` by tsc's rewriteRelativeImportExtensions, which is what lets
 # the same files be run directly by node/deno AND resolve through the npm exports map.
 build:
@@ -57,7 +57,7 @@ help:
 	@echo "  bench         Run every benchmark and print the table (no gate)"
 	@echo "  bench-check   Compare benchmarks against benches/results.json (the CI gate)"
 	@echo "  bench-update  Re-record the benchmark baseline"
-	@echo "  build         Compile lib/ + mod.ts to dist/ (ESM + .d.ts + maps)"
+	@echo "  build         Compile lib/ + mod.ts + cli.ts to dist/ (ESM + .d.ts + maps)"
 	@echo "  check         Everything CI runs: format, lint, doc gates, tests on both runtimes"
 	@echo "  ci            check + bench-check + smoke — the full CI surface, locally"
 	@echo "  clean         Remove dist/, docs/api/, _site/, tmp/ and node_modules/"

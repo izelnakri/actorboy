@@ -8,5 +8,5 @@
     "declarationMap": true,
     "sourceMap": true
   },
-  "include": ["lib/**/*.ts", "mod.ts"]
+  "include": ["lib/**/*.ts", "mod.ts", "cli.ts"]
 }

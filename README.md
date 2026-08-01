@@ -24,6 +24,25 @@ npm install actorboy     # Node, bundlers
 deno add jsr:@izelnakri/actorboy
 ```
 
+## CLI
+
+This is a JS API first — almost everything here is something you call from your own process. Two
+things are not, and they ship as the `actorboy` binary:
+
+```sh
+actorboy hub --port 4369 --cookie "$ACTORBOY_COOKIE"   # run the relay (epmd + the mesh)
+actorboy observe ws://localhost:4369                   # attach as a HIDDEN node, dump the cluster
+actorboy observe ws://localhost:4369 --json | jq .     # …or as one JSON object
+```
+
+The relay is a **server**: somebody has to run it, and shipping the binary beats asking every user
+to write the same four lines of glue. `observe` is Erlang's `:observer` reduced to data — it joins
+as a hidden node, so it reads `sys.node.info` from every peer without entering anyone's `list()`,
+rendezvous placement, or `:global`. It exits non-zero when a peer fails to answer, so
+`actorboy observe … >/dev/null` works as a health check.
+
+Both stand on `ws`, the optional peer dependency. Every other entry point installs with nothing.
+
 ## Result — the settled outcome
 
 A success is the **value itself**; a failure is the `Failure`. No box, no tuple, no unwrapping

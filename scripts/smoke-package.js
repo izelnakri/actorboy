@@ -121,6 +121,24 @@ try {
   process.stdout.write(
     execFileSync(process.execPath, ['consumer.js'], { ...STDIO, cwd: workspace }),
   );
+
+  // The `actorboy` binary, through the bin link npm just created — the one path that proves the
+  // shim resolves dist/cli.js from an INSTALLED layout, which nothing in the repo can check.
+  const binary = path.join(
+    workspace,
+    'node_modules',
+    '.bin',
+    IS_WINDOWS ? 'actorboy.cmd' : 'actorboy',
+  );
+  const version = execFileSync(binary, ['--version'], {
+    ...STDIO,
+    cwd: workspace,
+    shell: IS_WINDOWS,
+  }).trim();
+  if (!/^\d+\.\d+\.\d+/.test(version)) {
+    throw new Error(`the installed binary printed ${JSON.stringify(version)}, not a version`);
+  }
+  console.log(`smoke-package: bin/actorboy --version -> ${version}`);
 } finally {
   await rm(workspace, { recursive: true, force: true });
 }
