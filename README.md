@@ -215,6 +215,27 @@ fast past a peer that is already failing), `rateLimiter` (token bucket, sustaine
 burst), and the served unit's `maxMailbox`. `cluster()` is libcluster's polling formation:
 a strategy discovers peers, the manager diffs against the connected set and converges.
 
+### Fairness, priority, and CPU-bound work
+
+A single-threaded runtime cannot preempt anything, so fairness has to be cooperative. `yieldToLoop`
+is a BEAM-style reduction budget: a long handler that yields keeps the node answering other
+messages instead of freezing it. Priorities exist at three levels — per call (`{ priority }` on
+`call`/`cast`), per process (`self.setPriority`, Erlang's `Process.flag(:priority, …)`), and per
+subject via `dirtyDelegate`, which routes a genuinely CPU-bound subject onto a worker pool. That
+last one is the honest answer, and it is Erlang's too: a dirty scheduler exists because some work
+should not be on the main one at all.
+
+`self.postpone()` / `unstashAll()` are `gen_statem`'s postpone — selective receive, for a message
+that arrived in a state that cannot handle it yet.
+
+### Security and observability
+
+Distribution is authenticated by a **cookie challenge-response** (Erlang's `~/.erlang.cookie`, with
+a real challenge rather than a shared secret on the wire), runs over `wss`/TLS, and takes an
+`authorize` hook for per-subject policy. `metrics()` renders the telemetry bus as Prometheus text,
+`eventSourced` puts an event log behind a `Store` (Commanded/EventStore's model), and
+`rollingUpgrade` drives a cluster-wide relup over the `sys.upgrade` subject.
+
 ## Raft — the CP half
 
 CRDTs stay available under partition by never needing agreement. Some decisions *do* need it:
