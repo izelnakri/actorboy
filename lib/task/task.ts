@@ -1,5 +1,6 @@
 import type { Result } from '../result/result.ts';
 import {
+  define as defineFailure,
   Failure,
   ignore as failureIgnore,
   observed as failureObserved,
@@ -8,6 +9,7 @@ import {
   type Any as AnyFailure,
   type Failure as FailureOf,
   type FailureFactory,
+  type FailureOptions as FailureBuildOptions,
 } from '../result/failure.ts';
 
 /**
@@ -41,6 +43,47 @@ export type Executor<T> = (
 ) => unknown;
 
 /**
+ * The deadline in {@link TaskClass#await} elapsed before the work settled.
+ *
+ * ```ts
+ * AwaitTimeout({ ms: 5000 }).message; // 'await timed out after 5000ms'
+ * ```
+ */
+export const AwaitTimeout: FailureFactory<'AwaitTimeout', { ms: number }> = defineFailure(
+  'AwaitTimeout',
+  (data: { ms: number }) => `await timed out after ${data.ms}ms`,
+);
+
+/**
+ * {@link TaskClass#shutdown} settled the Task because the caller asked it to stop.
+ *
+ * ```ts
+ * Shutdown.is(Shutdown()); // true
+ * ```
+ */
+export const Shutdown: FailureFactory<'Shutdown', undefined> &
+  ((data?: undefined, options?: FailureBuildOptions) => FailureOf<'Shutdown', undefined>) =
+  defineFailure('Shutdown', 'task shut down');
+
+/**
+ * A {@link TaskClass#retry} attempt nothing will await again — the reason its signal fires.
+ *
+ * ```ts
+ * Abandoned.is(Abandoned()); // true
+ * ```
+ */
+export const Abandoned: FailureFactory<'Abandoned', undefined> &
+  ((data?: undefined, options?: FailureBuildOptions) => FailureOf<'Abandoned', undefined>) =
+  defineFailure('Abandoned', 'retry moved on from this attempt');
+
+/**
+ * The failure a combinator member declares — `never` for a plain promise, which declares none.
+ * Lets `Task.all`/`Task.race` union their members' `E` instead of widening it away, so a
+ * combined Task still reads as `Task<T, TheFailureYouDeclared>`.
+ */
+type DeclaredFailureOf<T> = T extends TaskClass<unknown, infer E> ? E : never;
+
+/**
  * `Task<T, E>` — a **lazy, retryable** superset of `Promise<T>` for error handling that respects
  * JavaScript's rules from the ground up. `E` is the *declared* failure type: the reason a caller
  * expects when it fails, and what {@link TaskClass#result} surfaces as the `Err`. It is advisory
@@ -71,7 +114,7 @@ export type Executor<T> = (
  *
  * The two-tier rule threads through every consuming method: a **declared failure** (a `Failure`)
  * is an outcome the caller planned for, a **bug** (any other rejection) is not. `result`,
- * `match`, `unwrapOr` and `expect` act only on declared failures and let bugs keep flying to the
+ * `match`, `unwrapOr` and `context` act only on declared failures and let bugs keep flying to the
  * one boundary that turns them into a crash report; `mapErr` (the adapter edge, where foreign
  * errors get classified *into* Failures) and `recover` (the crash boundary itself) are the two
  * deliberate catch-alls. `mapErr` takes a {@link define}d factory directly — `mapErr(Unreadable,
@@ -118,6 +161,9 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   /** Derivation lineage: the Task this one was derived from, and how to re-derive it — what
    *  makes restart/retry on a *chain* re-execute the chain's source, not just the last step. */
   #source: TaskClass<unknown, unknown> | undefined;
+  /** A combinator's members, kept so cancellation reaches them — lineage for a task with many
+   *  sources rather than one. Undefined on every non-combinator Task. */
+  #members: (() => readonly unknown[]) | undefined;
   #rederive: ((fresh: TaskClass<unknown, unknown>) => TaskClass<T, E>) | undefined;
   /** Rebuilds a combinator over freshly restarted members. A combinator has no single source
    *  to walk, so this is how `restart` reaches the work its members represent. */
@@ -219,6 +265,39 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   }
 
   /**
+   * `Promise.prototype.finally`, returning a **Task** — so cleanup no longer drops the chain out
+   * of Task-land the way `then`/`catch` do. Every spec behaviour is kept: `onFinally` takes no
+   * arguments, its return value is discarded, a thenable it returns is awaited, and anything it
+   * throws replaces the outcome.
+   *
+   * **Eager, like {@link TaskClass#ignore}** — and for the same reason. `finally` is overwhelmingly
+   * written fire-and-forget (`closeWithGrace(...).finally(() => process.exit(143))` in this very
+   * repo), and a lazy one nobody awaits would never run its cleanup. Laziness is right for
+   * building a pipeline; it is wrong for releasing a resource.
+   *
+   * ```ts
+   * let released = false;
+   * const value = await Task(() => 'body').finally(() => {
+   *   released = true; // runs whichever way the Task settles
+   * });
+   *
+   * value; // 'body' — the outcome passes through untouched
+   * released; // true
+   * ```
+   *
+   * Being eager, it carries {@link TaskClass#perform}'s caveat: the returned Task is running, so
+   * if it fails and nothing consumes it, that is an unhandled rejection. `task.finally(cleanup)`
+   * followed only by `.retry()` is the shape to watch — `retry` builds a fresh chain rather than
+   * consuming this one. Put `finally` after the retry, or `.result()` the outcome.
+   */
+  override finally(onFinally?: (() => void) | null): TaskClass<T, E> {
+    return this.#derive<T, E>(
+      () => super.finally(onFinally),
+      (fresh) => fresh.finally(onFinally),
+    ).perform();
+  }
+
+  /**
    * Starts the run **now** without suspending the caller (ember-concurrency's verb), so work
    * can overlap: `task.perform()` early, `await task` later joins the in-flight run. Idempotent
    * — on a running or settled Task it is a no-op join. Returns `this` for chaining.
@@ -257,13 +336,7 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
     this.#start();
     let timer: ReturnType<typeof setTimeout>;
     const deadline = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(
-        () =>
-          reject(
-            new Failure('AwaitTimeout', `await timed out after ${timeoutMs}ms`, { ms: timeoutMs }),
-          ),
-        timeoutMs,
-      );
+      timer = setTimeout(() => reject(AwaitTimeout({ ms: timeoutMs })), timeoutMs);
       // No unref: the deadline must HOLD the event loop (an unref'd timer lets Deno's
       // test sanitizer — and a bare Node script — drain the loop mid-wait); clearTimeout on
       // settle releases it immediately anyway.
@@ -295,30 +368,36 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
 
   /**
    * Aborts the run and reports what was there — Elixir's `Task.shutdown/2`. Fires the
-   * recipe's AbortSignal (cancellation-aware recipes — a `fetch(url, { signal })` — stop
-   * their work; JS cannot preempt others, which then finish detached), then yields for
+   * {@link Executor}'s AbortSignal, so work that was handed it — a `fetch(url, { signal })` —
+   * stops; JS cannot preempt work that ignores it, which finishes detached. Then yields for
    * `timeoutMs`: the settled `Result` if one landed, else `null` after settling the task
    * with a declared `Failure('Shutdown')` so every consumer resolves.
    *
+   * A {@link Recipe} declares no parameters and so never sees the signal — it cannot be
+   * interrupted, only abandoned. Take the executor shape for work that should stop.
+   *
    * ```ts
-   * const task = Task((_resolve, _reject, signal) => fetch('https://example.com', { signal }));
-   * task.perform();
-   * const outcome = await task.shutdown(50); // Result | null — whatever had already landed
-   * outcome === null || 'ok' in Object(outcome); // true
+   * const slow = Task<number>((resolve, _reject, signal) => {
+   *   const timer = setTimeout(() => resolve(1), 60_000);
+   *   signal.addEventListener('abort', () => clearTimeout(timer));
+   * });
+   * slow.perform();
+   *
+   * await slow.shutdown(10); // null — nothing had landed, and the timer was cleared
    * ```
    */
   async shutdown(timeoutMs = 5000): Promise<Result<T, E> | null> {
-    this.#controller ??= new AbortController();
-    const marker = new Failure('Shutdown', 'task shut down', undefined);
+    const marker = Shutdown();
     if (!this.#started) {
-      // Never ran: settle as shut down without ever invoking the recipe.
+      // Never ran: settle as shut down without ever invoking the work.
       this.#started = true;
+      this.#controller ??= new AbortController();
       this.#reject(marker);
     } else {
-      this.#controller.abort(marker);
+      this.#abort(marker);
     }
     const settled = await this.yield(timeoutMs).catch(() => null); // a bug counts as settled-nothing here
-    if (settled === null) this.#reject(marker); // non-signal-aware recipe: settle consumers anyway
+    if (settled === null) this.#reject(marker); // work that ignored the signal: settle consumers anyway
     // The marker settling is OUR doing, not a reply — Elixir's shutdown says nil for that.
     return settled === (marker as unknown) ? null : settled;
   }
@@ -491,6 +570,10 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * Lazy `Promise.all`: on await, everything starts together, resolves positionally, and
    * fail-fast applies — before the await, nothing has begun.
    *
+   * The combined Task keeps the members' declared failure — `Task.all` of two
+   * `Task<T, LoadFailure>` is a `Task<T[], LoadFailure>`, so `.result()` on it still
+   * discriminates the union you declared rather than a widened `Failure`.
+   *
    * ```ts
    * const both = Task.all([Task(() => 'a'), Task(() => 'b')]); // nothing has started yet
    * await both; // ['a', 'b'] — both started HERE
@@ -498,12 +581,14 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    */
   static override all<T extends readonly unknown[] | []>(
     values: T,
-  ): TaskClass<{ -readonly [P in keyof T]: Awaited<T[P]> }>;
+  ): TaskClass<{ -readonly [P in keyof T]: Awaited<T[P]> }, DeclaredFailureOf<T[number]>>;
+  static override all<T, E>(values: Iterable<TaskClass<T, E>>): TaskClass<Awaited<T>[], E>;
   static override all<T>(values: Iterable<T | PromiseLike<T>>): TaskClass<Awaited<T>[]>;
   static override all(values: Iterable<unknown>): TaskClass<unknown[]> {
     const members = snapshotOnce(values);
     const task = new TaskClass(() => Promise.all(members()));
     task.#remake = () => TaskClass.all(members().map(restarted));
+    task.#members = members;
     return task;
   }
 
@@ -515,12 +600,16 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * // 'fast'
    * ```
    */
-  static override race<T extends readonly unknown[] | []>(values: T): TaskClass<Awaited<T[number]>>;
+  static override race<T extends readonly unknown[] | []>(
+    values: T,
+  ): TaskClass<Awaited<T[number]>, DeclaredFailureOf<T[number]>>;
+  static override race<T, E>(values: Iterable<TaskClass<T, E>>): TaskClass<Awaited<T>, E>;
   static override race<T>(values: Iterable<T | PromiseLike<T>>): TaskClass<Awaited<T>>;
   static override race(values: Iterable<unknown>): TaskClass<unknown> {
     const members = snapshotOnce(values);
     const task = new TaskClass(() => Promise.race(members()));
     task.#remake = () => TaskClass.race(members().map(restarted));
+    task.#members = members;
     return task;
   }
 
@@ -537,6 +626,7 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
     const members = snapshotOnce(values);
     const task = new TaskClass(() => Promise.any(members()));
     task.#remake = () => TaskClass.any(members().map(restarted));
+    task.#members = members;
     return task;
   }
 
@@ -561,6 +651,7 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
     const members = snapshotOnce(values);
     const task = new TaskClass(() => Promise.allSettled(members()));
     task.#remake = () => TaskClass.allSettled(members().map(restarted));
+    task.#members = members;
     return task;
   }
 
@@ -741,10 +832,15 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    *   return tries;
    * });
    * await Task.retry(flaky); // 2
+   * await Task.retry(flaky, 3, { delayMs: 1 }); // the instance method's options, unchanged
    * ```
    */
-  static retry<T, E>(task: TaskClass<T, E>, times = 1): TaskClass<T, E> {
-    return task.retry(times);
+  static retry<T, E>(
+    task: TaskClass<T, E>,
+    times = 1,
+    options: RetryDelay | RetryOptions = {},
+  ): TaskClass<T, E> {
+    return task.retry(times, options);
   }
 
   /**
@@ -1152,10 +1248,25 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * `root.map(f)` has to reach `root`, which is where the executor (and its subscription) is.
    */
   #abandon(): void {
-    this.#controller?.abort(
-      new Failure('Abandoned', 'retry moved on from this attempt', undefined),
-    );
-    if (this.#source !== undefined) this.#source.#abandon();
+    this.#abort(Abandoned());
+  }
+
+  /**
+   * Aborts this Task and everything upstream of it.
+   *
+   * A derived Task holds no work of its own — `map`/`mapErr`/`context` all wrap `this.then(...)`,
+   * so the executor with the live `fetch` belongs to the SOURCE. Aborting only this link fired a
+   * signal nobody was listening to and left the real work running, which made cancellation a
+   * no-op for every chain — and a chain is what the docs show. A combinator's members are
+   * reached the same way, through the snapshot it kept for `restart`.
+   */
+  #abort(reason: unknown): void {
+    this.#controller ??= new AbortController();
+    this.#controller.abort(reason);
+    if (this.#source !== undefined) this.#source.#abort(reason);
+    for (const member of this.#members?.() ?? []) {
+      if (member instanceof TaskClass) member.#abort(reason);
+    }
   }
 
   // ── The one bridge to the value world ────────────────────────────────────────

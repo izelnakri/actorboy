@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { module, test } from 'qunitx';
-import { Task, Failure } from '../../lib/task/index.ts';
+import { Task, Failure, AwaitTimeout, Shutdown } from '../../lib/task/index.ts';
 
 const NotFound = Failure.define('NotFound', (data: { id: number }) => `no user ${data.id}`);
 
@@ -327,9 +327,23 @@ module('Task | ignore', { concurrency: true }, () => {
   });
 
   test('a fire-and-forget rejection is absorbed, never an unhandled rejection', async (assert) => {
-    Task<number>(() => Promise.reject(NotFound({ id: 9 }))).ignore('cleanup');
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.true(true, 'the runner would have flagged an unhandled rejection by now');
+    // Watched rather than assumed: `assert.true(true)` here passed whether or not `ignore`
+    // absorbed anything. Filtered to OUR failure so a neighbouring concurrent test's noise
+    // cannot fail this one.
+    const unhandled: unknown[] = [];
+    const watch = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', watch);
+    try {
+      Task<number>(() => Promise.reject(NotFound({ id: 9 }))).ignore('cleanup');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    } finally {
+      process.off('unhandledRejection', watch);
+    }
+
+    assert.false(
+      unhandled.some((reason) => NotFound.is(reason)),
+      'the ignored rejection never reached the unhandled-rejection handler',
+    );
   });
 
   test('Task.ignore is the one-shot static spelling — same semantics, no intermediate', async (assert) => {
@@ -463,10 +477,7 @@ module('Task | builders', { concurrency: true }, () => {
 
     assert.strictEqual(started, 2, 'both attempts ran');
     assert.strictEqual(abandoned, 2, 'and each was told when its deadline passed');
-    assert.true(
-      Failure.is(outcome) && outcome.code === 'AwaitTimeout',
-      'the deadline is the failure',
-    );
+    assert.true(AwaitTimeout.is(outcome), 'the deadline is the failure');
   });
 
   test('a pending wait is abortable, so shutdown during one settles now, not later', async (assert) => {
@@ -592,6 +603,39 @@ module('Task | combinators', { concurrency: true }, () => {
 
   test('Task.all fail-fasts on the first rejection, like Promise.all', async (assert) => {
     await assert.rejects(Task.all([loadUser(1), loadUser(0)]), /no user 0/);
+  });
+
+  // The combined Task must keep the members' DECLARED failure rather than widening it, or every
+  // chain that passes through a combinator loses the type it was carrying and `.result()` hands
+  // back a union the caller can no longer discriminate. The compile-time half of this is the
+  // `Failure.Of<typeof NotFound>` annotation below; the runtime half is that the same value
+  // arrives bare.
+  test('Task.all keeps the declared failure of its members', async (assert) => {
+    const both: Task<{ id: number; name: string }[], Failure.Of<typeof NotFound>> = Task.all([
+      loadUser(1),
+      loadUser(0),
+    ]);
+
+    const outcome = await both.result();
+
+    assert.true(NotFound.is(outcome), 'the failure survives the combinator as its own type');
+    assert.strictEqual(NotFound.is(outcome) ? outcome.data.id : -1, 0, 'and keeps its payload');
+  });
+
+  test('Task.race keeps it too, and a plain promise member declares nothing', async (assert) => {
+    const raced: Task<number, Failure.Of<typeof NotFound>> = Task.race([
+      Task<number, Failure.Of<typeof NotFound>>(() => {
+        throw NotFound({ id: 7 });
+      }),
+    ]);
+    assert.true(NotFound.is(await raced.result()));
+
+    // A promise contributes `never` to the union, so mixing one in does not widen the rest.
+    const mixed: Task<number, Failure.Of<typeof NotFound>> = Task.all([
+      Task<number, Failure.Of<typeof NotFound>>(() => 1),
+      Promise.resolve(2),
+    ]).map((values) => values[0]);
+    assert.strictEqual(await mixed, 1);
   });
 
   test('Task.race and Task.any pick a settlement without losing laziness', async (assert) => {
@@ -777,7 +821,7 @@ module('Task | two-tier', { concurrency: true }, () => {
       return { id: x.n, name: 'never' }; // TypeError: reading n of undefined — a bug
     });
 
-  test('expect adds context to a declared failure, preserving code and data', async (assert) => {
+  test('context adds a message to a declared failure, preserving code and data', async (assert) => {
     try {
       await loadUser(0).context('the run needs a user here');
       assert.true(false, 'unreachable');
@@ -790,7 +834,7 @@ module('Task | two-tier', { concurrency: true }, () => {
     }
   });
 
-  test('expect lets a bug pass through uncontextualised', async (assert) => {
+  test('context lets a bug pass through uncontextualised', async (assert) => {
     await assert.rejects(buggy().context('context that must NOT wrap a bug'), TypeError);
   });
 
@@ -909,7 +953,7 @@ module('Task | retry & restart', { concurrency: true }, () => {
 // ── Data-first statics — the twin law: Task.m(t, …) ≡ t.m(…) ─────────────────
 
 module('Task | data-first statics', { concurrency: true }, () => {
-  test('map / mapErr / recover / expect delegate exactly', async (assert) => {
+  test('map / mapErr / recover / context delegate exactly', async (assert) => {
     assert.strictEqual(await Task.map(loadUser(1), (u) => u.name), 'u1');
     await assert.rejects(
       Task.mapErr(loadUser(0), (e) => new RangeError('twin: ' + (e as Failure.Any).code)),
@@ -986,11 +1030,16 @@ module('Task | unconsumed rejection', { concurrency: true }, () => {
   });
 
   test('an unstarted Task cannot crash — laziness means dropped chains are dead code', async (assert) => {
+    let ran = false;
     Task(() => {
+      ran = true;
       throw NotFound({ id: 1 });
-    }); // never awaited, never performed: the recipe NEVER runs, so nothing can reject
+    }); // never awaited, never performed
     await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.true(true, 'no rejection existed to go unhandled');
+
+    // The claim is that the work never ran — which is WHY nothing could reject. Asserting that
+    // directly fails if laziness ever regresses; the previous `assert.true(true)` could not.
+    assert.false(ran, 'the work never ran, so there was no rejection to go unhandled');
   });
 });
 
@@ -1047,6 +1096,63 @@ module('Task | failure observation seam', () => {
 });
 
 // ── ensure — the declared invariant on the success value ───────────────────────
+
+module('Task | finally', { concurrency: true }, () => {
+  test('returns a Task, so cleanup no longer drops the chain out of Task-land', async (assert) => {
+    const task = Task(() => 'body').finally(() => {});
+
+    assert.true(task instanceof Task, 'then/catch hand back a plain Promise; finally does not');
+    assert.strictEqual(await task.map((body) => body.toUpperCase()), 'BODY', 'still chainable');
+  });
+
+  test('keeps every Promise.prototype.finally behaviour', async (assert) => {
+    assert.strictEqual(await Task(() => 1).finally(() => 99), 1, "onFinally's return is discarded");
+
+    await assert.rejects(
+      Task(() => 1).finally(() => {
+        throw new Error('cleanup blew up');
+      }),
+      /cleanup blew up/,
+      'but a throwing onFinally does replace the outcome',
+    );
+
+    await assert.rejects(
+      Task(() => Promise.reject(NotFound({ id: 3 }))).finally(() => {}),
+      /no user 3/,
+    );
+
+    const startedAt = Date.now();
+    await Task(() => 1).finally(() => new Promise((resolve) => setTimeout(resolve, 30)));
+    assert.true(Date.now() - startedAt >= 25, 'a thenable returned by onFinally is awaited');
+
+    let args: unknown[] = ['not called'];
+    await Task(() => 1).finally((...received: unknown[]) => (args = received));
+    assert.deepEqual(args, [], 'onFinally receives nothing — it cannot see the outcome');
+  });
+
+  // Deliberately EAGER, like ignore(): `finally` is overwhelmingly written fire-and-forget, and
+  // a lazy one nobody awaited would silently never release the resource.
+  test('runs the cleanup with no await at all — the fire-and-forget idiom', async (assert) => {
+    let released = false;
+    Task(() => 'x').finally(() => (released = true));
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    assert.true(released, 'a lazy finally would have released nothing here');
+  });
+
+  test('cleanup re-runs per attempt when the retry is upstream of it', async (assert) => {
+    let attempts = 0;
+    let cleanups = 0;
+    const flaky = Task(() => {
+      if (++attempts < 2) throw new Error('again');
+      return attempts;
+    });
+
+    assert.strictEqual(await flaky.retry(2).finally(() => cleanups++), 2);
+    assert.strictEqual(cleanups, 1, 'one cleanup for the whole retried chain');
+  });
+});
 
 module('Task | ensure', { concurrency: true }, () => {
   const TooSmall = Failure.define('TooSmall', (d: { got: number }) => `too small: ${d.got}`);
@@ -1113,7 +1219,7 @@ module('Task | elixir family', () => {
     const slow = Task<number>(() => new Promise<number>((res) => (settle = res)));
     const timedOut = await slow.await(10).catch((e: unknown) => e);
     assert.true(Failure.is(timedOut));
-    assert.strictEqual((timedOut as Failure.Any).code, 'AwaitTimeout');
+    assert.true(AwaitTimeout.is(timedOut), 'the guard narrows it — no string compare');
     settle(7);
     assert.strictEqual(await slow, 7, 'the run survived the deadline — a later await joins it');
   });
@@ -1130,7 +1236,7 @@ module('Task | elixir family', () => {
     assert.deepEqual(await Task.awaitMany([Task(() => 1), Task(() => 2)], 1000), [1, 2]);
     const stuck = [Task(() => 1), Task<number>(() => new Promise<never>(() => {}))];
     const timedOut = await Task.awaitMany(stuck, 10).catch((e: unknown) => e);
-    assert.strictEqual((timedOut as Failure.Any).code, 'AwaitTimeout');
+    assert.true(AwaitTimeout.is(timedOut), 'the guard narrows it — no string compare');
   });
 
   test('completed is settled before any window', async (assert) => {
@@ -1149,10 +1255,42 @@ module('Task | elixir family', () => {
       });
     }).perform();
     const outcome = await task.shutdown(50);
-    assert.true(aborted, 'the AbortSignal reached the recipe');
-    assert.true(outcome === null || Failure.is(outcome), 'nothing useful had landed');
+    assert.true(aborted, 'the AbortSignal reached the executor');
+    assert.strictEqual(outcome, null, 'nothing useful had landed');
     const after = await task.result();
     assert.true(Failure.is(after), 'every later consumer resolves — no hung awaits');
+    assert.true(Shutdown.is(after), 'and it says why');
+  });
+
+  // The work lives on the SOURCE — `map`/`mapErr`/`context` only wrap `this.then(...)`. Aborting
+  // one link therefore has to walk the chain, or cancelling anything built the way the docs show
+  // fires a signal nobody is listening to and leaves the real work running.
+  test('shutdown reaches through a derived chain to the work that is actually running', async (assert) => {
+    let aborted = false;
+    const root = Task<number>((resolve, _reject, signal) => {
+      signal.addEventListener('abort', () => (aborted = true));
+      setTimeout(() => resolve(1), 60_000);
+    });
+    const chain = root.map((n) => n + 1).context('reading the thing');
+    chain.perform();
+
+    assert.strictEqual(await chain.shutdown(20), null);
+    assert.true(aborted, "the ROOT's signal fired, not just the derived link's");
+  });
+
+  test('shutdown reaches a combinator’s members too', async (assert) => {
+    let aborted = false;
+    const member = Task<number>((resolve, _reject, signal) => {
+      signal.addEventListener('abort', () => (aborted = true));
+      setTimeout(() => resolve(1), 60_000);
+    });
+    const combined = Task.all([member]);
+    combined.perform();
+    await new Promise((resolve) => setTimeout(resolve, 5)); // let Promise.all subscribe
+
+    await combined.shutdown(20);
+
+    assert.true(aborted, 'a combinator has many sources, and cancellation reaches each');
   });
 
   test('shutdown of a never-started task settles it without running the recipe', async (assert) => {
