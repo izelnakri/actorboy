@@ -231,12 +231,47 @@ function jobQueue(options: {
   const cancelled = new Set<string>(); // ids cancelled mid-attempt — end terminal, don't retry
   const paused = new Set<string>();
   const seenQueues = new Set<string>(['default']); // queues to poll (configured + inserted-into)
+  const uniqueIndex = new Map<string, Set<string>>(); // signature -> ids: O(1) `unique` dedup
+  const queueJobs = new Map<string, Set<string>>(); // queue -> its job ids: scoped claim + seenQueues evict
+  const signatureOf = (worker: string, args: unknown, meta?: Record<string, unknown>): string =>
+    JSON.stringify([worker, args, meta ?? null]);
+  const indexAdd = (job: Job): void => {
+    const sig = signatureOf(job.worker, job.args, job.meta);
+    let ids = uniqueIndex.get(sig);
+    if (!ids) uniqueIndex.set(sig, (ids = new Set()));
+    ids.add(job.id);
+    let q = queueJobs.get(job.queue);
+    if (!q) queueJobs.set(job.queue, (q = new Set()));
+    q.add(job.id);
+  };
+  const indexRemove = (job: Job): void => {
+    const sig = signatureOf(job.worker, job.args, job.meta);
+    const ids = uniqueIndex.get(sig);
+    if (ids) {
+      ids.delete(job.id);
+      if (ids.size === 0) uniqueIndex.delete(sig);
+    }
+    const q = queueJobs.get(job.queue);
+    if (q) {
+      q.delete(job.id);
+      if (q.size === 0) {
+        queueJobs.delete(job.queue);
+        seenQueues.delete(job.queue); // last job in an ad-hoc queue gone — stop tracking its name
+      }
+    }
+  };
   let alive = true;
 
   const persistJob = (job: Job): Promise<void> => options.store.save(jobKey(job.id), job);
-  const persistIndex = (): Promise<void> => options.store.save(INDEX, [...jobs.keys()]);
+  const canList = typeof options.store.keys === 'function';
+  // When the store can list keys by prefix, the job keys themselves ARE the index — so skip the
+  // rewrite-the-whole-id-array-on-every-insert/complete blob (was O(total jobs) per op).
+  const persistIndex = (): Promise<void> =>
+    canList ? Promise.resolve() : options.store.save(INDEX, [...jobs.keys()]);
   const removeJob = async (id: string): Promise<void> => {
+    const job = jobs.get(id);
     jobs.delete(id);
+    if (job) indexRemove(job);
     await persistIndex(); // index first — a crash leaves an ignorable orphan key, never a ghost id
     await options.store.clear(jobKey(id));
   };
@@ -254,15 +289,19 @@ function jobQueue(options: {
     ) {
       await options.store.rescue(prefix, now() - reclaimAfterMs);
     }
-    const ids = ((await options.store.load(INDEX)) as string[] | undefined) ?? [];
-    for (const id of ids) {
-      const job = (await options.store.load(jobKey(id))) as Job | undefined;
-      if (!job) continue;
+    const keys = canList
+      ? await options.store.keys!(`${prefix}:`)
+      : (((await options.store.load(INDEX)) as string[] | undefined) ?? []).map(jobKey);
+    for (const key of keys) {
+      const job = (await options.store.load(key)) as Job | undefined;
+      // A prefix scan also surfaces the INDEX blob / lease keys — skip anything that isn't a job.
+      if (!job || typeof job !== 'object' || !('id' in job) || !('worker' in job)) continue;
       // Errors round-tripped through the Store as wire forms — revive each to a live Failure so a
       // reloaded job's errors are Failures too (the whole point: uniform on fresh AND reloaded).
       for (const entry of job.errors)
         entry.error = reviveFailure(entry.error as unknown as SerializedFailure);
       jobs.set(job.id, job);
+      indexAdd(job);
     }
   })();
 
@@ -338,11 +377,12 @@ function jobQueue(options: {
     if (opts.unique) {
       // Identity includes `meta`, so two cron schedules that share a worker+args (each tagged with
       // its own `{ cron: expr }`) don't collapse into one — while a single schedule still dedupes.
-      const signature = JSON.stringify([worker, args, opts.meta ?? null]);
-      for (const existing of jobs.values()) {
-        if (JSON.stringify([existing.worker, existing.args, existing.meta ?? null]) === signature)
-          return existing;
-      }
+      const ids = uniqueIndex.get(signatureOf(worker, args, opts.meta));
+      if (ids)
+        for (const id of ids) {
+          const existing = jobs.get(id);
+          if (existing) return existing; // a pending twin already exists — dedupe to it
+        }
     }
     const job: Job = {
       id: crypto.randomUUID(),
@@ -359,6 +399,7 @@ function jobQueue(options: {
     };
     jobs.set(job.id, job);
     seenQueues.add(job.queue); // so the drain loop polls this queue even if it wasn't configured
+    indexAdd(job);
     await persistJob(job); // durable BEFORE the caller is told "queued"
     await persistIndex();
     queueMicrotask(() => void tick()); // run it now if a slot is free — the poll is only the backstop
@@ -400,8 +441,10 @@ function jobQueue(options: {
       for (const job of claimed) jobs.set(job.id, job); // reflect the store's mark in the local view
       return claimed;
     }
-    const due = [...jobs.values()]
-      .filter((job) => job.queue === queue && runnable(job, now()))
+    // Scan only THIS queue's jobs (via the index), not every job in every queue, per tick.
+    const due = [...(queueJobs.get(queue) ?? [])]
+      .map((id) => jobs.get(id)!)
+      .filter((job) => runnable(job, now()))
       .sort((a, b) => a.priority - b.priority || a.scheduledAt - b.scheduledAt)
       .slice(0, demand);
     for (const job of due) {

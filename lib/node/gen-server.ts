@@ -29,9 +29,17 @@
  */
 import { Failure, isFailure, type Any as AnyFailure } from '../result/failure.ts';
 import { Task } from '../task/task.ts';
+import { yieldWith, higher, type Priority } from './scheduler.ts';
 import type { NodeHandle, Trace } from './node.ts';
 import type { Service } from './supervisor.ts';
 import type { Store } from './store.ts';
+
+// The pump's reduction budget — BEAM preempts a process after ~2000 reductions; here a "reduction"
+// is one processed message. `SLICE_MS` is a wall-clock ceiling for the same slice, so a handful of
+// slow (but awaiting) handlers can't hold the loop for long either. When either trips, the pump
+// yields (see scheduler.ts) so other actors, timers, and I/O run before it resumes draining.
+const REDUCTIONS = 2000;
+const SLICE_MS = 5;
 
 /** A cancellable scheduled message — the handle {@link Self#sendAfter} returns (Erlang's timer ref). */
 export interface TimerRef {
@@ -61,12 +69,33 @@ export interface Self<K extends string = string> {
    *  reply nobody awaits. The transport already sheds a call that ARRIVES past its deadline; this
    *  catches one that crosses the line mid-work. */
   readonly deadline?: number;
-  /** `GenServer.cast(self(), …)` — enqueue a message to itself; it runs AFTER the current one. */
-  cast(subject: K, payload?: unknown): void;
+  /** The scheduling priority this message carried, if the caller set one — read it to PROPAGATE
+   *  priority to a nested `call`/`cast` (`node.call(to, subj, arg, { priority: self.priority })`). */
+  readonly priority?: Priority;
+  /** `GenServer.cast(self(), …)` — enqueue a message to itself; it runs AFTER the current one.
+   *  `opts.priority` elevates the pump for that self-message. */
+  cast(subject: K, payload?: unknown, opts?: { priority?: Priority }): void;
   /** `Process.send_after(self(), msg, ms)` — schedule a self-`cast` after `ms`, through the mailbox. */
   sendAfter(subject: K, payload: unknown, ms: number): TimerRef;
   /** `Process.exit(self(), reason)` — terminate this unit (propagates to links; a supervisor restarts). */
   exit(reason?: AnyFailure): void;
+  /**
+   * `Process.flag(:priority, level)` — set THIS unit's base scheduling priority at runtime (Erlang's
+   * per-process priority flag), returning the PREVIOUS value. Takes effect on the pump's next slice.
+   * Distinct from {@link Self.priority}, which is the current MESSAGE's carried priority: this changes
+   * the unit's own baseline (raise it while doing latency-critical work, lower it for a background sweep).
+   */
+  setPriority(level: Priority): Priority;
+  /**
+   * Selective receive — `gen_statem`'s `postpone` / Akka's stash. Defer the message being handled:
+   * it is neither applied nor answered now, but held and replayed (from the top of its handler) on
+   * the next {@link Self.unstashAll}. Call it from a guard at the START of a handler (before side
+   * effects — the handler re-runs on replay) when the unit isn't ready for this message yet. The
+   * caller keeps waiting; pair it with `unstashAll` once the unit becomes ready (e.g. after init).
+   */
+  postpone(): void;
+  /** Replay every stashed (postponed) message back through the mailbox, in the order they arrived. */
+  unstashAll(): void;
 }
 
 /**
@@ -141,10 +170,10 @@ export interface GenServer<S, K extends string = string> {
    * wire hop — no `node.call(nodeName, '<name>.<subject>', …)` round-trip. A handler that returns
    * (or throws) a declared `Failure` rejects the Task; an over-full mailbox rejects with `Overloaded`.
    */
-  call(subject: K, payload?: unknown): Task<unknown, AnyFailure>;
+  call(subject: K, payload?: unknown, opts?: { priority?: Priority }): Task<unknown, AnyFailure>;
   /** Fire-and-forget the local client — `gen_server:cast`. Runs the handler through the mailbox
-   *  (state still mutates + persists), drops the reply. */
-  cast(subject: K, payload?: unknown): void;
+   *  (state still mutates + persists), drops the reply. `opts.priority` elevates the pump for it. */
+  cast(subject: K, payload?: unknown, opts?: { priority?: Priority }): void;
   /** The currently running version. */
   version(): string;
   /** Swap via the mailbox — lands strictly BETWEEN messages, even async ones. An eager Task
@@ -162,7 +191,9 @@ export interface GenServer<S, K extends string = string> {
    * with the same reason unless it traps.
    */
   exit(reason?: AnyFailure): void;
-  /** Links this unit to another served unit, bidirectionally — Erlang's `link/1`: exits propagate both ways. */
+  /** Links this unit bidirectionally — Erlang's `link/1`: exits propagate both ways. Pass another local
+   *  handle for an in-process link, or a remote ref `{ node, name }` for a DISTRIBUTED link (a unit
+   *  on another node — its exit, or that node going down, signals this unit). */
   link(other: object): void;
   /**
    * Erlang's `trap_exit`: instead of dying with a linked unit, receive `(from, reason)` —
@@ -206,6 +237,13 @@ export interface GenServerOptions {
    * supervisor's `onExit`; most code reaches for {@link GenServer#link}/`trapExit` instead.
    */
   onDown?: (reason: AnyFailure) => void;
+  /**
+   * Scheduling priority — Erlang's process priority. When this unit's mailbox pump exhausts its
+   * reduction slice and yields, a `high`-priority unit resumes before `normal` before `low`, so a
+   * background flood can't delay a latency-sensitive unit. Defaults to `normal`. Ordering only; it
+   * never lets one unit block another (each pump stays an independent async body).
+   */
+  priority?: Priority;
 }
 
 /**
@@ -263,7 +301,12 @@ export function genServer<S, K extends string = string>(
   // THE MAILBOX — gen_server's real guarantee, which run-to-completion alone cannot give
   // once handlers are async: every message (and every swap) enqueues, and ONE pump drains
   // strictly serially, awaiting each to completion. Nothing interleaves, ever.
-  type Envelope = { run: () => unknown; settle: (v: unknown) => void; fail: (e: unknown) => void };
+  type Envelope = {
+    run: () => unknown;
+    settle: (v: unknown) => void;
+    fail: (e: unknown) => void;
+    priority?: Priority; // the message's carried priority, if any (elevates the pump's yield)
+  };
   const queue: Envelope[] = [];
   let pumping = false;
   const enqueue = <R>(run: () => R | Promise<R>): Promise<R> =>
@@ -271,30 +314,63 @@ export function genServer<S, K extends string = string>(
       queue.push({ run, settle: settle as (v: unknown) => void, fail });
       void pump();
     });
+  // A self-settling enqueue: `run` owns its caller promise (resolve/reject captured in its closure),
+  // so a POSTPONED message can be re-stashed and replayed with no second allocation — the common
+  // (non-postpone) path costs exactly one promise per message, same as before. The envelope's own
+  // settle/fail are no-ops. The plain `enqueue` above still serves the settle-by-return callers
+  // (sys.upgrade, swap, trapExit).
+  const noop = (): void => {};
+  const enqueueRun = (run: () => Promise<void>, msgPriority?: Priority): void => {
+    queue.push({ run, settle: noop, fail: noop, priority: msgPriority });
+    void pump();
+  };
+  let priority: Priority = options.priority ?? 'normal'; // the unit's base priority; Process.flag can change it
   const pump = async (): Promise<void> => {
     if (pumping) return;
     pumping = true;
     if (options.store) await ready; // never process a message against un-restored state
     // (skipped without a store so the pump shifts synchronously — maxMailbox depth stays exact)
+    let budget = REDUCTIONS;
+    let sliceStart = performance.now();
+    let slicePriority = priority; // elevate to the highest-priority message seen this slice
     while (queue.length > 0) {
       const envelope = queue.shift()!;
+      if (envelope.priority) slicePriority = higher(slicePriority, envelope.priority);
       try {
         envelope.settle(await envelope.run());
       } catch (thrown) {
         envelope.fail(thrown); // the caller gets RemoteCrash; the unit keeps serving
       }
+      // Spend a reduction; when the slice is exhausted, yield the loop (in priority order) so timers,
+      // I/O, and every OTHER actor's pump run before this one resumes. A message that carried a higher
+      // priority elevates this yield, so a high-priority request resumes ahead of low-priority units.
+      // Under the budget (the common case — a mailbox under REDUCTIONS deep) nothing yields.
+      if (--budget <= 0 || performance.now() - sliceStart >= SLICE_MS) {
+        await yieldWith(slicePriority);
+        budget = REDUCTIONS;
+        sliceStart = performance.now();
+        slicePriority = priority;
+      }
     }
     pumping = false;
   };
 
+  // Selective-receive buffer: messages a handler POSTPONED, held as their re-runnable closures.
+  // `unstashAll` replays them back through the mailbox in arrival order (they run from the top again).
+  const stash: Array<{ run: () => Promise<void>; priority?: Priority }> = [];
+  const unstashAll = (): void => {
+    for (const held of stash.splice(0)) enqueueRun(held.run, held.priority);
+  };
+
   // The one invocation path, shared by the remote handler (node.handle, below) and the typed LOCAL
-  // client (handle.call/cast). Returns the reply — a value, or a declared Failure (Overloaded /
-  // UnitDown / whatever the handler returns). A handler THROW rejects the enqueue promise.
+  // client (handle.call/cast). Returns the caller's reply promise (a value, or a declared Failure —
+  // Overloaded / UnitDown / whatever the handler returns). `run` self-settles that promise: a normal
+  // message resolves it; a postponed one is re-stashed and the promise waits; a bug rejects it.
   const invoke = (
     key: string,
     payload: unknown,
     from: string,
-    meta?: { trace?: Trace; deadline?: number },
+    meta?: { trace?: Trace; deadline?: number; priority?: Priority },
   ): unknown => {
     // Load shedding — BEAM mailboxes are unbounded (a real footgun under overload); this is the
     // disciplined floor. A full mailbox rejects new work as a declared Overloaded the caller can
@@ -306,46 +382,68 @@ export function genServer<S, K extends string = string>(
         depth: queue.length,
       });
     }
-    return enqueue(async () => {
-      if (!unitAlive)
-        return downReason ?? new Failure('UnitDown', `${name} is down`, { name, from: name });
-      // The unit's view of itself for THIS message — self() + Process-style ops, who sent it, and
-      // the call's trace/deadline (undefined for a local self-send, which has neither).
-      const self: Self = {
-        name,
-        from,
-        trace: meta?.trace,
-        deadline: meta?.deadline,
-        cast: castSelf,
-        sendAfter,
-        exit: (reason) => handle.exit(reason),
-      };
-      let outcome: { state: S; reply?: unknown; persist?: boolean };
-      try {
-        outcome = await current.handlers[key](state, payload, self);
-      } catch (thrown) {
-        // "Let it crash": a BUG (non-Failure throw) terminates the unit when crashOnError is set —
-        // down() propagates the exit (links → onExit → supervisor restart). A declared Failure is an
-        // expected reply, never a crash; a bug WITHOUT the flag rejects as RemoteCrash, unit alive.
-        if (options.crashOnError && !isFailure(thrown)) {
-          const reason = new Failure(
-            'UnitCrashed',
-            `${name} crashed handling ${key}: ${String(thrown)}`,
-            { name, subject: key },
-            { cause: thrown },
-          );
-          down(reason);
-          throw reason; // the in-flight caller learns the unit died (bug carried as .cause)
+    // ONE native promise per message (same allocation as the old enqueue). `run` closes over its
+    // resolve/reject, so a postponed message re-stashes the SAME closure and replays with no new alloc.
+    return new Promise<unknown>((resolve, reject) => {
+      const run = async (): Promise<void> => {
+        if (!unitAlive) {
+          resolve(downReason ?? new Failure('UnitDown', `${name} is down`, { name, from: name }));
+          return;
         }
-        throw thrown;
-      }
-      state = outcome.state;
-      // PERSIST-BEFORE-ACK — the delta-loss fix: the durable write completes (inside the serial
-      // pump, so ordering holds) BEFORE the reply is released. A caller's ack means the state
-      // change is durable; there is no periodic-snapshot window to lose. Reads opt out with
-      // `persist: false`.
-      if (options.store && outcome.persist !== false) await options.store.save(storeKey, state);
-      return outcome.reply;
+        let postponed = false;
+        // The unit's view of itself for THIS message — self() + Process-style ops, who sent it, the
+        // call's trace/deadline, and the stash controls (postpone THIS message, replay the stash).
+        const self: Self = {
+          name,
+          from,
+          trace: meta?.trace,
+          deadline: meta?.deadline,
+          priority: meta?.priority,
+          cast: (subject, payload, opts) => castSelf(subject, payload, opts?.priority),
+          sendAfter,
+          exit: (reason) => handle.exit(reason),
+          setPriority: (level) => {
+            const previous = priority;
+            priority = level; // the pump reads `priority` at each slice reset — takes effect next slice
+            return previous;
+          },
+          postpone: () => void (postponed = true),
+          unstashAll,
+        };
+        try {
+          const outcome = await current.handlers[key](state, payload, self);
+          // Selective receive: a postponed message is neither applied nor answered now — hold its run
+          // and replay it (from the top) on the next unstashAll. The caller's promise keeps waiting.
+          if (postponed) {
+            stash.push({ run, priority: meta?.priority });
+            return;
+          }
+          state = outcome.state;
+          // PERSIST-BEFORE-ACK — the durable write completes (inside the serial pump, so ordering
+          // holds) BEFORE the reply is released. Reads opt out with `persist: false`.
+          if (options.store && outcome.persist !== false) await options.store.save(storeKey, state);
+          resolve(outcome.reply);
+        } catch (thrown) {
+          // "Let it crash": a BUG (non-Failure throw) terminates the unit when crashOnError is set —
+          // down() propagates the exit (links → onExit → supervisor restart). A declared Failure is an
+          // expected reply, never a crash; a bug WITHOUT the flag becomes RemoteCrash, unit alive.
+          if (options.crashOnError && !isFailure(thrown)) {
+            const reason = new Failure(
+              'UnitCrashed',
+              `${name} crashed handling ${key}: ${String(thrown)}`,
+              { name, subject: key },
+              { cause: thrown },
+            );
+            down(reason);
+            reject(reason); // the in-flight caller learns the unit died (bug carried as .cause)
+            return;
+          }
+          reject(thrown);
+        }
+      };
+      // the pump runs it; `run` settles this promise (or re-stashes on postpone). The message's
+      // priority elevates the pump's yield so a high-priority call drains ahead of low-priority units.
+      enqueueRun(run, meta?.priority);
     });
   };
 
@@ -388,8 +486,10 @@ export function genServer<S, K extends string = string>(
     if (!unitAlive) return;
     if (trap) {
       const handler = trap;
-      void enqueue(() => handler(from, reason)); // trap handling SERIALIZES with messages
-    } else {
+      void enqueue(() => handler(from, reason)); // a trapper hears EVERY linked exit, Normal included
+    } else if (reason.code !== 'Normal') {
+      // A NON-trapping unit dies WITH an abnormally-exiting link, but a `Normal` exit (a linked
+      // process finishing cleanly) leaves it be — Erlang's exit-signal rule.
       down(
         new Failure(
           'UnitDown',
@@ -401,11 +501,15 @@ export function genServer<S, K extends string = string>(
     }
   };
   const myPort: ExitPort = { name, deliverExit };
+  // Register with the node so a DISTRIBUTED link (a unit on another node) can deliver an exit here,
+  // and a nodedown can synthesize one — the cross-wire half of link/1.
+  const stopLinkTarget = node.registerLinkTarget?.(name, deliverExit);
   const down = (reason: AnyFailure): void => {
     if (!unitAlive) return;
     unitAlive = false;
     downReason = reason;
     if (options.via) node.unregister(options.via.registry, options.via.key); // release the name
+    unstashAll(); // replay held messages so their callers settle (as UnitDown) instead of hanging
     for (const timer of timers) clearTimeout(timer); // a dead unit fires no scheduled messages
     timers.clear();
     for (const peer of links) {
@@ -413,6 +517,8 @@ export function genServer<S, K extends string = string>(
       peer.deliverExit(name, reason); // both ends on any exit) — no dead port lingers in a survivor
     }
     links.clear();
+    stopLinkTarget?.(); // stop receiving remote exits
+    node.notifyRemoteLinks?.(name, reason); // signal units linked to me from other nodes
     stopInspect?.(); // leave the node's local-unit table — a dead name is no longer served here
     options.onDown?.(reason); // AFTER links propagate — observers see a fully-settled death
   };
@@ -420,8 +526,10 @@ export function genServer<S, K extends string = string>(
   // Self-ops (Elixir's Process.*, bound to this unit) — the constant part of the `self` a handler
   // gets; `from` varies per message and is spread in by invoke(). Self-sends reuse invoke(), so they
   // ride the same mailbox: enqueued behind the current message, never reentrant.
-  const castSelf = (subject: string, payload?: unknown): void =>
-    void Promise.resolve(invoke(subject, payload, name)).catch(() => {});
+  const castSelf = (subject: string, payload?: unknown, msgPriority?: Priority): void =>
+    void Promise.resolve(
+      invoke(subject, payload, name, msgPriority ? { priority: msgPriority } : undefined),
+    ).catch(() => {});
   const sendAfter = (subject: string, payload: unknown, ms: number): TimerRef => {
     const timer = setTimeout(() => {
       timers.delete(timer);
@@ -440,11 +548,16 @@ export function genServer<S, K extends string = string>(
     // `node.call` path would surface, this does too: a declared Failure (returned OR thrown) rejects
     // the Task as itself; a bug (a non-Failure throw) rejects as RemoteCrash — so Task<_, AnyFailure>
     // never leaks a bare Error, local or remote.
-    call: (subject, payload) =>
+    call: (subject, payload, opts) =>
       Task<unknown, AnyFailure>(async () => {
         let reply: unknown;
         try {
-          reply = await invoke(subject, payload, name);
+          reply = await invoke(
+            subject,
+            payload,
+            name,
+            opts?.priority ? { priority: opts.priority } : undefined,
+          );
         } catch (thrown) {
           throw isFailure(thrown)
             ? thrown
@@ -453,8 +566,10 @@ export function genServer<S, K extends string = string>(
         if (isFailure(reply)) throw reply;
         return reply;
       }).perform(),
-    cast: (subject, payload) =>
-      void Promise.resolve(invoke(subject, payload, name)).catch(() => {}),
+    cast: (subject, payload, opts) =>
+      void Promise.resolve(
+        invoke(subject, payload, name, opts?.priority ? { priority: opts.priority } : undefined),
+      ).catch(() => {}),
     version: () => current.version,
     upgrade: (next) => Task(() => enqueue(() => apply(next))).perform(),
     state: () => state,
@@ -463,6 +578,17 @@ export function genServer<S, K extends string = string>(
     exit: (reason) =>
       down(reason ?? new Failure('UnitDown', `${name} exited`, { name, from: name })),
     link(other) {
+      // A remote ref `{ node, name }` links across the wire (Erlang's link to a remote pid); a local
+      // handle links in-process via the shared exitPorts.
+      const remote = other as { node?: unknown; name?: unknown };
+      if (
+        typeof remote.node === 'string' &&
+        typeof remote.name === 'string' &&
+        !exitPorts.has(other)
+      ) {
+        node.linkUnit(name, remote.node, remote.name);
+        return;
+      }
       const port = exitPorts.get(other);
       if (!port) throw new TypeError('link target is not a served unit');
       links.add(port);
@@ -537,9 +663,10 @@ export function spawnProcess(
   let alive = true;
   const links = new Set<ExitPort>();
   const stopInspect = node.inspect(name, () => ({ kind: 'process', alive }));
-  // A bare process does not trap exits — a linked death takes it down and propagates onward.
+  // A bare process does not trap exits — an ABNORMAL linked death takes it down; a linked `Normal`
+  // exit (a partner finishing cleanly) does not.
   const deliverExit = (from: string, reason: AnyFailure): void => {
-    if (alive)
+    if (alive && reason.code !== 'Normal')
       down(
         new Failure(
           'ProcessDown',
@@ -553,11 +680,14 @@ export function spawnProcess(
   const down = (reason: AnyFailure | null): void => {
     if (!alive) return;
     alive = false;
+    // A normal exit (fun returned) still SIGNALS links — a `Normal` reason — so a TRAPPING linker is
+    // told the process finished (Erlang's `{'EXIT', _, normal}`, for completion tracking); a
+    // non-trapping linker ignores it. An abnormal reason propagates as itself. Either way both ends
+    // unlink so no dead port lingers.
+    const signal = reason ?? new Failure('Normal', `${name} exited normally`, { name, from: name });
     for (const peer of links) {
-      otherLinks.get(peer)?.delete(myPort); // unlink on the PEER's side too (Erlang: any exit unlinks)
-      // reason === null is a NORMAL exit (Erlang `:normal`) — the link is dropped but no signal is
-      // delivered; only an abnormal reason propagates onward.
-      if (reason !== null) peer.deliverExit(name, reason);
+      otherLinks.get(peer)?.delete(myPort);
+      peer.deliverExit(name, signal);
     }
     links.clear();
     stopInspect();

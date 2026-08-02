@@ -32,6 +32,7 @@ import {
 import { Task } from '../task/task.ts';
 import { ORSet, type CrdtState, type CausalContext } from './crdt.ts';
 import { execute as emit } from '../telemetry/telemetry.ts';
+import type { Priority } from './scheduler.ts';
 
 /**
  * A distributed trace context — OpenTelemetry's shape, sized for this wire. Every `call`/`cast`
@@ -66,11 +67,23 @@ export type Frame = {
     | 'call'
     | 'reply'
     | 'ping'
-    | 'pong';
+    | 'pong'
+    | 'link'
+    | 'unitexit'
+    | 'challenge'
+    | 'auth';
   from: string;
   to?: string;
+  /** On a `challenge`/`auth` frame: the per-connection nonce (transport-level cluster-join auth). */
+  nonce?: string;
+  /** On an `auth` frame: HMAC-SHA-256(secret, nonce) — the cookie proof (see auth.ts). */
+  digest?: string;
   /** On a `hello`: whether the sender is a HIDDEN node — attached but not a full member. */
   hidden?: boolean;
+  /** On a `link`/`unitexit` frame: the target unit's name on the RECEIVING node. */
+  unit?: string;
+  /** On a `link`/`unitexit` frame: the peer unit's name on the SENDING node (`from`). */
+  peer?: string;
   subject?: string;
   /** Process-group name for join/leave frames. */
   group?: string;
@@ -85,10 +98,19 @@ export type Frame = {
   crdt?: CrdtState;
   /** Whether a 'crdt' frame carries FULL state (anti-entropy) vs a one-op delta. */
   full?: boolean;
+  /** A batch of catch-up deltas on a 'crdt' anti-entropy reply — applied in order via mergeDelta. */
+  deltas?: CrdtState[];
+  /** On a 'sync': the last seq of the RECIPIENT's deltas the sender has applied (its catch-up cursor). */
+  want?: number;
+  /** On a 'crdt' anti-entropy reply: the sender's seq this payload brings the receiver up to. */
+  upto?: number;
   /** A node's causal context for a 'sync' request — the peer replies with what's beyond it. */
   cc?: CausalContext;
   /** The distributed trace this call/cast belongs to — see {@link Trace}. */
   trace?: Trace;
+  /** Scheduling priority carried by a `call`/`cast` — the receiving unit's pump drains this message
+   *  at (at least) this priority. Absent = the unit's own base priority. */
+  priority?: Priority;
   /** Transport-internal epidemic-gossip envelope (mesh `gossipFanout`): dedup id + hops left. */
   gossip?: { id: string; ttl: number };
   /** Absolute epoch-ms when the ROOT caller gives up — nested calls inherit and never outlive it. */
@@ -143,6 +165,13 @@ export interface NodeHandle {
   /** Whether the node participates in the cluster — Elixir's `Node.alive?/0`. */
   alive(): boolean;
   /**
+   * Resolves once this node has merged a peer's full state (the hello handshake), or after a short
+   * grace window if no peer answers. A node REUSING a name (a respawned worker pool slot) must await
+   * this before it mints its own CRDT dots — otherwise a fresh dot collides with the dead
+   * incarnation's and its registrations are silently dropped as already-seen.
+   */
+  synced(): Promise<void>;
+  /**
    * Connected peers — Erlang's `Node.list/0,1`. Defaults to `visible` (non-hidden members); pass a
    * {@link NodeListKind} for `hidden` / `connected` / `this` / `known`. Excludes peers that said bye
    * or went nodedown.
@@ -182,6 +211,18 @@ export interface NodeHandle {
   /** Remove a replicated `fact` (observed-remove) and gossip the removal. */
   dropFact(fact: string): void;
   /**
+   * DISTRIBUTED-LINK plumbing (used by `genServer`; rarely called directly). A unit registers its
+   * exit-delivery under its `name` so a remote link can reach it; `unlink` runs on the unit's death.
+   */
+  registerLinkTarget(name: string, deliver: (from: string, reason: AnyFailure) => void): () => void;
+  /**
+   * Link a LOCAL unit to a REMOTE one — Erlang's `link/1` across the wire. An exit on either side (or
+   * `remoteNode` going nodedown) signals the other. Symmetric: the far node records the reverse link.
+   */
+  linkUnit(localName: string, remoteNode: string, remoteName: string): void;
+  /** A local unit died — signal its remote linkers (called by `genServer` on `down`). */
+  notifyRemoteLinks(localName: string, reason: AnyFailure): void;
+  /**
    * Every replicated fact currently present with `prefix` — RAW, with no liveness filter: the
    * caller decides which segment is the owning node and intersects with {@link NodeHandle.list} /
    * {@link NodeHandle.self} to hide facts owned by a downed peer (as the registry does internally).
@@ -213,7 +254,7 @@ export interface NodeHandle {
     handler: (
       payload: unknown,
       from: string,
-      meta?: { trace?: Trace; deadline?: number },
+      meta?: { trace?: Trace; deadline?: number; priority?: Priority },
     ) => unknown,
   ): void;
   /** The trace of the message currently being handled (synchronous window), if any. */
@@ -233,10 +274,11 @@ export interface NodeHandle {
     to: string,
     subject: string,
     payload?: unknown,
-    timeoutMs?: number,
+    opts?: number | { timeoutMs?: number; priority?: Priority },
   ): Task<T, AnyFailure>;
-  /** Fire-and-forget message — no reply, no deadline. */
-  cast(to: string, subject: string, payload?: unknown): void;
+  /** Fire-and-forget message — no reply, no deadline. `opts.priority` elevates the receiving unit's
+   *  pump for this message (see {@link Priority}). */
+  cast(to: string, subject: string, payload?: unknown, opts?: { priority?: Priority }): void;
   /** Says bye to peers and closes the transport — Elixir's `Node.stop/0`. */
   stop(): void;
   /**
@@ -327,9 +369,17 @@ export function start(
      * without becoming a member. It still participates in process groups (`:pg`, like Erlang).
      */
     hidden?: boolean;
+    /**
+     * Per-message authorization — the application-level gate above the transport's cluster-join auth
+     * (see `wsTransport`'s `secret`). Runs before every inbound `call`/`cast` handler; return `false`
+     * to deny. A denied `call` is answered with a declared `Unauthorized` failure; a denied `cast` is
+     * dropped. Wire it to a capability/role check on `(subject, from, payload)`.
+     */
+    authorize?: (request: { subject: string; from: string; payload: unknown }) => boolean;
   } = {},
 ): NodeHandle {
   const hidden = options.hidden ?? false;
+  const authorize = options.authorize;
   const peers = new Map<string, { hidden: boolean }>(); // name -> its visibility (Erlang's node table)
   const handlers = new Map<
     string,
@@ -349,9 +399,39 @@ export function start(
         listener.fn({ node: peer, status });
   };
   const pending = new Map<number, (frame: Frame) => void>();
+  // Distributed links: a local unit registers its exit-delivery by name; `remoteLinks` maps a local
+  // unit to the remote units it is linked to (`node<NUL>unit`), so a unit death or a nodedown signals
+  // the far side. In-process links stay in gen-server's exitPorts; THIS is the cross-wire half.
+  const LINKSEP = String.fromCharCode(0);
+  const linkTargets = new Map<string, (from: string, reason: AnyFailure) => void>();
+  const remoteLinks = new Map<string, Set<string>>();
+  const addRemoteLink = (localUnit: string, remoteNode: string, remoteUnit: string): void => {
+    let set = remoteLinks.get(localUnit);
+    if (!set) remoteLinks.set(localUnit, (set = new Set()));
+    set.add(`${remoteNode}${LINKSEP}${remoteUnit}`);
+  };
   // Membership + registry live in ONE convergent CRDT (ORSet of facts) — a dropped
   // join/register self-heals via anti-entropy, and a healed partition reconciles.
   const crdt = new ORSet(name);
+  const appliedFrom = new Map<string, number>(); // peer -> last seq of ITS deltas I have applied
+  // First-sync gate: a node REUSING a name (a respawned worker) must merge the cluster's context —
+  // learning its own high-water dot — BEFORE it mints a fresh dot, or that dot collides with the dead
+  // incarnation's and its registrations are silently dropped. `synced()` resolves on the first
+  // full-state a peer hands back (hello anti-entropy), or a timeout if none comes (no peers / fresh).
+  let firstSyncDone = false;
+  let onFirstSync = (): void => {};
+  const syncedPromise = new Promise<void>((resolve) => (onFirstSync = resolve));
+  // Declared here, assigned after the hello below. `let`, not `const` at the assignment site: on a
+  // synchronous transport (the memory hub) a peer's full-state reply lands INSIDE `transport.send`,
+  // so markSynced() runs before the timer exists — a `const` further down would be in its temporal
+  // dead zone and throw.
+  let syncGraceTimer: ReturnType<typeof setTimeout> | undefined;
+  const markSynced = (): void => {
+    if (firstSyncDone) return;
+    firstSyncDone = true;
+    clearTimeout(syncGraceTimer); // a peer answered first; the grace window has nothing left to do
+    onFirstSync();
+  };
   const myGroups = new Set<string>();
   const roundRobin = new Map<string, number>();
   const myKeys = new Set<string>(); // "registry\u0000key" — what I own
@@ -461,7 +541,22 @@ export function start(
     const wasHidden = peers.get(peer)?.hidden ?? false; // capture visibility before we drop it
     if (peers.delete(peer)) {
       for (const fn of monitors) fn(peer);
+      appliedFrom.delete(peer); // a returned/restarted peer re-syncs from its current seq
       notifyNode(peer, wasHidden, 'down'); // Erlang nodedown, node_type-filtered
+      // A distributed link to a unit on the dead peer fires as if that unit exited (Erlang: nodedown
+      // breaks remote links). Synthesize the exit for each local unit linked across.
+      const prefix = `${peer}${LINKSEP}`;
+      for (const [localUnit, set] of remoteLinks) {
+        for (const key of [...set]) {
+          if (!key.startsWith(prefix)) continue;
+          set.delete(key);
+          linkTargets.get(localUnit)?.(
+            `${key.slice(prefix.length)}@${peer}`,
+            new Failure('NodeDown', `${peer} went down`, { node: peer }),
+          );
+        }
+        if (set.size === 0) remoteLinks.delete(localUnit);
+      }
     }
   };
   const inspectors = new Map<string, () => Record<string, unknown>>();
@@ -516,18 +611,54 @@ export function start(
           to: frame.from,
           crdt: crdt.state(),
           full: true,
+          upto: crdt.seq(),
         });
       }
+    } else if (frame.kind === 'link') {
+      // A remote unit `frame.peer@frame.from` links to my local unit `frame.unit`. Record the reverse
+      // link if the unit exists; otherwise tell them it is already down (noproc), so their link fires.
+      const local = frame.unit!;
+      if (linkTargets.has(local)) addRemoteLink(local, frame.from, frame.peer!);
+      else
+        dispatch({
+          kind: 'unitexit',
+          from: name,
+          to: frame.from,
+          unit: frame.peer,
+          peer: local,
+          ...encode(new Failure('NoProc', `no unit ${local} on ${name}`, { unit: local })),
+        });
+    } else if (frame.kind === 'unitexit') {
+      // The remote unit `frame.peer@frame.from` exited — signal my local unit `frame.unit`.
+      const local = frame.unit!;
+      remoteLinks.get(local)?.delete(`${frame.from}${LINKSEP}${frame.peer}`);
+      linkTargets.get(local)?.(`${frame.peer}@${frame.from}`, decode(frame) as AnyFailure);
     } else if (frame.kind === 'crdt') {
       // A convergent update: a one-op delta (broadcast) or full state (anti-entropy / hello).
-      if (frame.full) crdt.merge(frame.crdt!);
-      else crdt.mergeDelta(frame.crdt!);
+      if (frame.deltas)
+        for (const d of frame.deltas) crdt.mergeDelta(d); // anti-entropy catch-up
+      else if (frame.full) {
+        crdt.merge(frame.crdt!);
+        markSynced(); // got the cluster's context (incl. my own high-water) — safe to mint dots
+      } else crdt.mergeDelta(frame.crdt!); // one-op broadcast
+      if (frame.upto !== undefined) appliedFrom.set(frame.from, frame.upto);
       checkConflicts();
     } else if (frame.kind === 'sync') {
       // A peer asked what it is missing (its causal context) — reply with full state iff I know
       // anything beyond it (otherwise the sync is a no-op).
-      if (crdt.hasBeyond(frame.cc!))
-        dispatch({ kind: 'crdt', from: name, to: frame.from, crdt: crdt.state(), full: true });
+      const catchUp = crdt.deltasSince(frame.want ?? 0);
+      if (catchUp === null)
+        // the peer is behind my delta buffer — fall back to full state
+        dispatch({
+          kind: 'crdt',
+          from: name,
+          to: frame.from,
+          crdt: crdt.state(),
+          full: true,
+          upto: crdt.seq(),
+        });
+      else if (catchUp.length > 0)
+        dispatch({ kind: 'crdt', from: name, to: frame.from, deltas: catchUp, upto: crdt.seq() });
     } else if (frame.kind === 'bye') {
       declareDown(frame.from);
     } else if (frame.kind === 'ping') {
@@ -540,7 +671,12 @@ export function start(
         {},
         { subject: frame.subject, from: frame.from, trace: frame.trace },
       );
-      const meta = { trace: frame.trace, deadline: frame.deadline };
+      const meta = { trace: frame.trace, deadline: frame.deadline, priority: frame.priority };
+      if (
+        authorize &&
+        !authorize({ subject: frame.subject!, from: frame.from, payload: decode(frame) })
+      )
+        return; // denied cast — silently dropped, like a message to a process that isn't listening
       handling(meta, () => handlers.get(frame.subject!)?.(decode(frame), frame.from, meta));
     } else if (frame.kind === 'call') {
       // Shed doomed work: a call that arrives PAST its root deadline is answered with the
@@ -558,13 +694,30 @@ export function start(
           ),
         });
       }
+      if (
+        authorize &&
+        !authorize({ subject: frame.subject!, from: frame.from, payload: decode(frame) })
+      ) {
+        return void dispatch({
+          kind: 'reply',
+          from: name,
+          to: frame.from,
+          ref: frame.ref,
+          ...encode(
+            new Failure('Unauthorized', `${frame.from} may not call ${frame.subject}`, {
+              subject: frame.subject,
+              from: frame.from,
+            }),
+          ),
+        });
+      }
       const handler = handlers.get(frame.subject!);
       emit(
         ['node', 'handle'],
         {},
         { subject: frame.subject, from: frame.from, trace: frame.trace },
       );
-      const meta = { trace: frame.trace, deadline: frame.deadline };
+      const meta = { trace: frame.trace, deadline: frame.deadline, priority: frame.priority };
       const outcome = handler
         ? Promise.resolve()
             .then(() => handling(meta, () => handler(decode(frame), frame.from, meta)))
@@ -598,6 +751,16 @@ export function start(
   };
   transport.onFrame((frame) => receive(frame));
   transport.send({ kind: 'hello', from: name, hidden });
+  // If no peer answers with state within the grace window (no cluster, or a whole-cluster restart
+  // where every vv is fresh anyway), unblock `synced()` so a waiting join doesn't hang.
+  //
+  // Deliberately NOT unref'd, unlike the tick/anti-entropy intervals: those only need to run while
+  // something else keeps the loop alive, whereas this timer is the ONLY thing that can settle a
+  // promise a caller is already awaiting. Un-ref'd, `await node.synced()` on a peerless node in an
+  // otherwise-idle loop never resolves — deno's test sanitizer reports it as "promise resolution is
+  // still pending but the event loop has already resolved". It cannot delay an exit by more than the
+  // window, because markSynced() and stop() both clear it.
+  if (!firstSyncDone) syncGraceTimer = setTimeout(markSynced, 1000);
 
   // The observer protocol — one subject any node (or a browser dashboard node) can call to
   // read this node's live state. Erlang's :observer, reduced to data over the same wire.
@@ -639,7 +802,7 @@ export function start(
   transport.onReopen?.(() => {
     transport.send({ kind: 'hello', from: name, hidden });
     // Re-push my full CRDT state after a reconnect so peers re-learn my registrations.
-    transport.send({ kind: 'crdt', from: name, crdt: crdt.state(), full: true });
+    transport.send({ kind: 'crdt', from: name, crdt: crdt.state(), full: true, upto: crdt.seq() });
   });
 
   const awaitRef = <R>(
@@ -677,15 +840,20 @@ export function start(
   const nodeHandle: NodeHandle = {
     self: () => name,
     alive: () => alive,
+    synced: () => syncedPromise,
     list: (kind = 'visible') => {
       if (kind === 'this') return [name];
       if (kind === 'known') return [name, ...peers.keys()];
-      const entries = [...peers];
-      const wanted =
-        kind === 'connected'
-          ? entries
-          : entries.filter(([, v]) => (kind === 'hidden' ? v.hidden : !v.hidden));
-      return wanted.map(([n]) => n);
+      // One pass, one allocation. Spreading the map into an entries array, filtering it and then
+      // mapping it allocated three times on `visible` — which is both the default and the hottest
+      // read in the system (every `group:` route and every membership diff calls it).
+      const wanted: string[] = [];
+      for (const [peer, info] of peers) {
+        if (kind === 'connected' || (kind === 'hidden' ? info.hidden : !info.hidden)) {
+          wanted.push(peer);
+        }
+      }
+      return wanted;
     },
     join(group) {
       myGroups.add(group);
@@ -725,6 +893,30 @@ export function start(
     },
     putFact: (fact) => broadcastDelta(crdt.add(fact)),
     dropFact: (fact) => broadcastDelta(crdt.remove(fact)),
+    registerLinkTarget: (unitName, deliver) => {
+      linkTargets.set(unitName, deliver);
+      return () => linkTargets.delete(unitName);
+    },
+    linkUnit: (localName, remoteNode, remoteName) => {
+      addRemoteLink(localName, remoteNode, remoteName);
+      dispatch({ kind: 'link', from: name, to: remoteNode, unit: remoteName, peer: localName });
+    },
+    notifyRemoteLinks: (localName, reason) => {
+      const set = remoteLinks.get(localName);
+      if (!set) return;
+      for (const key of set) {
+        const sep = key.indexOf(LINKSEP);
+        dispatch({
+          kind: 'unitexit',
+          from: name,
+          to: key.slice(0, sep),
+          unit: key.slice(sep + 1),
+          peer: localName,
+          ...encode(reason),
+        });
+      }
+      remoteLinks.delete(localName);
+    },
     facts: (prefix) => crdt.values().filter((f) => f.startsWith(prefix)),
     ping(peer, timeoutMs = 5000) {
       const task = awaitRef<'pong' | 'pang'>(
@@ -745,7 +937,15 @@ export function start(
       return () => nodeListeners.delete(listener);
     },
     handle: (subject, handler) => void handlers.set(subject, handler),
-    call<T>(to: string, subject: string, payload?: unknown, timeoutMs = 5000) {
+    call<T>(
+      to: string,
+      subject: string,
+      payload?: unknown,
+      opts?: number | { timeoutMs?: number; priority?: Priority },
+    ) {
+      // Backward-compatible: the 4th arg is still a bare timeout number, or an options object.
+      const timeoutMs = typeof opts === 'number' ? opts : (opts?.timeoutMs ?? 5000);
+      const priority = typeof opts === 'object' ? opts.priority : undefined;
       const trace = childTrace();
       const started = performance.now();
       // gRPC-style budget: a nested call never outlives the ROOT caller. The effective timeout
@@ -801,13 +1001,14 @@ export function start(
         pending.set(id, (frame) => {
           clearTimeout(timer);
           pending.delete(id);
+          const value = decode(frame);
+          const failed = isFailure(value);
           emit(
             ['node', 'call', 'stop'],
             { duration: performance.now() - started },
-            { to, subject, trace },
+            { to, subject, trace, error: failed }, // `error` drives error-rate metrics
           );
-          const value = decode(frame);
-          if (isFailure(value))
+          if (failed)
             reject(value); // a remote DECLARED failure stays declared here
           else resolve(value as T);
         });
@@ -820,6 +1021,7 @@ export function start(
           ref: id,
           trace,
           deadline,
+          priority,
           ...encode(payload),
         });
         return promise;
@@ -842,7 +1044,7 @@ export function start(
     },
     units: () => [...inspectors.keys()],
     unit: (name) => inspectors.get(name)?.(),
-    cast(to, subject, payload) {
+    cast(to, subject, payload, opts) {
       // A group cast reaches EVERY member (pg-style broadcast); a via: cast reaches the key's
       // owner; a node cast reaches one node.
       let targets: string[];
@@ -861,6 +1063,7 @@ export function start(
           subject,
           trace,
           deadline,
+          priority: opts?.priority,
           ...encode(payload),
         });
     },
@@ -869,6 +1072,7 @@ export function start(
       alive = false;
       clearInterval(tickTimer);
       clearInterval(syncTimer);
+      clearTimeout(syncGraceTimer); // a stopped node will never sync; don't hold the loop for it
       transport.send({ kind: 'bye', from: name });
       transport.close?.();
     },
@@ -909,7 +1113,7 @@ export function start(
       const list = [...peers.keys()];
       if (list.length === 0) return;
       const peer = list[cursor++ % list.length];
-      dispatch({ kind: 'sync', from: name, to: peer, cc: crdt.context() });
+      dispatch({ kind: 'sync', from: name, to: peer, want: appliedFrom.get(peer) ?? 0 });
     }, antiEntropyMs ?? 10000);
     (syncTimer as { unref?: () => void }).unref?.();
   }
