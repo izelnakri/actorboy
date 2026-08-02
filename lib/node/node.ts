@@ -29,6 +29,7 @@ import {
   type Any as AnyFailure,
 } from '../result/failure.ts';
 import { Task } from '../task/task.ts';
+import { ORSet, type CrdtState, type CausalContext } from './crdt.ts';
 
 /** One frame on the wire. Payloads must be structured-clone-safe; Failures ride `$failure`. */
 export type Frame = {
@@ -39,6 +40,8 @@ export type Frame = {
     | 'leave'
     | 'register'
     | 'unregister'
+    | 'crdt'
+    | 'sync'
     | 'cast'
     | 'call'
     | 'reply'
@@ -56,6 +59,12 @@ export type Frame = {
   ref?: number;
   payload?: unknown;
   $failure?: SerializedFailure;
+  /** CRDT payload for 'crdt' frames (a delta or full state). */
+  crdt?: CrdtState;
+  /** Whether a 'crdt' frame carries FULL state (anti-entropy) vs a one-op delta. */
+  full?: boolean;
+  /** A node's causal context for a 'sync' request — the peer replies with what's beyond it. */
+  cc?: CausalContext;
 };
 
 /**
@@ -128,6 +137,14 @@ export interface NodeHandle {
   ping(name: string, timeoutMs?: number): Task<'pong' | 'pang', never>;
   /** Fires `fn(name)` when a peer says bye or its transport drops — Elixir's `Node.monitor/2`. Returns the un-monitor. */
   monitor(fn: (name: string) => void): () => void;
+  /**
+   * Reports every peer coming UP and going DOWN — Erlang's `:net_kernel.monitor_nodes(true)`
+   * (`{nodeup, node}` / `{nodedown, node}`). Unlike {@link NodeHandle.monitor} (down only), this
+   * also fires on a first hello and on a reconnect, so membership-driven work — rebalancing a
+   * key range onto a newly-joined host, warming a cache — can react to scale-up too. Returns the
+   * un-monitor.
+   */
+  monitorNodes(fn: (event: { node: string; status: 'up' | 'down' }) => void): () => void;
   /** Registers the handler for a subject; the reply (value or Failure) travels back to callers. */
   handle(subject: string, handler: (payload: unknown, from: string) => unknown): void;
   /** Request/response with a deadline. `to` may be a node name, `'group:<name>'` (round-robin
@@ -211,55 +228,86 @@ export function heartbeat(
 export function start(
   name: string,
   transport: Transport,
-  options: { tick?: { everyMs?: number; missAfter?: number } | false } = {},
+  options: {
+    tick?: { everyMs?: number; missAfter?: number } | false;
+    antiEntropyMs?: number | false;
+  } = {},
 ): NodeHandle {
   const peers = new Set<string>();
   const handlers = new Map<string, (payload: unknown, from: string) => unknown>();
   const monitors = new Set<(name: string) => void>();
+  const nodeListeners = new Set<(event: { node: string; status: 'up' | 'down' }) => void>();
   const pending = new Map<number, (frame: Frame) => void>();
-  const groups = new Map<string, Set<string>>(); // group -> members (peers and self)
+  // Membership + registry live in ONE convergent CRDT (ORSet of facts) — a dropped
+  // join/register self-heals via anti-entropy, and a healed partition reconciles.
+  const crdt = new ORSet(name);
   const myGroups = new Set<string>();
   const roundRobin = new Map<string, number>();
-  // Registry: registry -> (key -> owner node). Unique key = single owner, conflicts resolved
-  // deterministically (smallest node name) so every node converges. myKeys = what I own.
-  const registries = new Map<string, Map<string, string>>();
-  const myKeys = new Set<string>(); // "registry\u0000key"
+  const myKeys = new Set<string>(); // "registry\u0000key" — what I own
   const conflictHandlers = new Map<string, () => void>(); // rk -> fire when superseded
-  const claim = (registry: string, key: string, owner: string): void => {
-    if (!registries.has(registry)) registries.set(registry, new Map());
-    const table = registries.get(registry)!;
-    const held = table.get(key);
-    // Deterministic tiebreak: the smaller node name wins, so a race converges everywhere.
-    if (held === undefined || owner < held) table.set(key, owner);
+  const gfact = (group: string, member: string) => `g\u001f${group}\u001f${member}`;
+  const rfact = (registry: string, key: string, owner: string) =>
+    `r\u001f${registry}\u001f${key}\u001f${owner}`;
+
+  // Liveness (`peers`) is SEPARATE from registrations (`crdt`): reads intersect them, so a
+  // nodedown HIDES a peer's entries (routing fails over) without touching the CRDT, and they
+  // reappear if it returns — no flapping, no lost registrations on a false nodedown.
+  const isLive = (node: string) => node === name || peers.has(node);
+  const factsWithPrefix = (prefix: string): string[] =>
+    crdt
+      .values()
+      .filter((f) => f.startsWith(prefix))
+      .map((f) => f.slice(prefix.length));
+  const groupMembersOf = (group: string): string[] =>
+    factsWithPrefix(`g\u001f${group}\u001f`).filter(isLive);
+  const allGroups = (): Record<string, string[]> => {
+    const out: Record<string, string[]> = {};
+    for (const fact of crdt.values()) {
+      if (!fact.startsWith('g\u001f')) continue;
+      const rest = fact.slice(2);
+      const sep = rest.indexOf('\u001f');
+      const group = rest.slice(0, sep);
+      const member = rest.slice(sep + 1);
+      if (isLive(member)) (out[group] ??= []).push(member);
+    }
+    return out;
   };
-  const release = (registry: string, key: string, owner: string): void => {
-    const table = registries.get(registry);
-    if (table?.get(key) === owner) table.delete(key);
-  };
-  const pruneOwner = (owner: string): void => {
-    for (const table of registries.values())
-      for (const [key, held] of [...table]) if (held === owner) table.delete(key);
+  const ownersOf = (registry: string, key: string): string[] =>
+    factsWithPrefix(`r\u001f${registry}\u001f${key}\u001f`).filter(isLive);
+
+  // Broadcast a one-op CRDT delta (from crdt.add/remove) to every peer — immediate propagation;
+  // anti-entropy (full state) backstops any that's dropped.
+  const broadcastDelta = (delta: CrdtState): void =>
+    transport.send({ kind: 'crdt', from: name, crdt: delta, full: false });
+
+  // After any merge: a key I own may now have a smaller LIVE owner — fire its conflict handler
+  // (drives serve({via}) self-terminate). A partition that elected two owners heals to one.
+  const checkConflicts = (): void => {
+    for (const rk of [...myKeys]) {
+      const [registry, key] = rk.split('\u0000');
+      const owners = ownersOf(registry, key);
+      const winner = owners.length ? owners.reduce((a, b) => (a < b ? a : b)) : name;
+      if (winner !== name) {
+        myKeys.delete(rk);
+        const onConflict = conflictHandlers.get(rk);
+        conflictHandlers.delete(rk);
+        onConflict?.();
+      }
+    }
   };
 
-  // A peer is gone (a polite bye, a dropped socket, OR a net-tick timeout): prune it from
-  // every group and registry and fire monitors — Erlang's nodedown, one place.
+  // A peer is gone (bye, dropped socket, or net-tick timeout): drop it from liveness — its
+  // entries are hidden at once and monitors fire; the CRDT is left intact so it recovers
+  // cleanly if it returns.
   const declareDown = (peer: string): void => {
-    for (const group of [...groups.keys()]) memberLeft(group, peer);
-    pruneOwner(peer);
-    if (peers.delete(peer)) for (const fn of monitors) fn(peer);
+    if (peers.delete(peer)) {
+      for (const fn of monitors) fn(peer);
+      for (const fn of nodeListeners) fn({ node: peer, status: 'down' }); // Erlang nodedown
+    }
   };
   const inspectors = new Map<string, () => Record<string, unknown>>();
   let ref = 0;
   let alive = true;
-
-  const memberJoined = (group: string, member: string): void => {
-    if (!groups.has(group)) groups.set(group, new Set());
-    groups.get(group)!.add(member);
-  };
-  const memberLeft = (group: string, member: string): void => {
-    groups.get(group)?.delete(member);
-    if (groups.get(group)?.size === 0) groups.delete(group);
-  };
 
   const encode = (value: unknown): Pick<Frame, 'payload' | '$failure'> =>
     isFailure(value) ? { $failure: toJSON(value) } : { payload: value };
@@ -278,32 +326,27 @@ export function start(
     if (frame.kind === 'hello') {
       if (!peers.has(frame.from)) {
         peers.add(frame.from);
+        for (const fn of nodeListeners) fn({ node: frame.from, status: 'up' }); // Erlang nodeup
         transport.send({ kind: 'hello', from: name, to: frame.from }); // answer so both sides list()
-        // Gossip my group memberships AND registry keys to the newcomer — a late joiner learns
-        // the whole topology from the hello answer.
-        for (const group of myGroups)
-          transport.send({ kind: 'join', from: name, to: frame.from, group });
-        for (const rk of myKeys) {
-          const [registry, key] = rk.split('\u0000');
-          transport.send({ kind: 'register', from: name, to: frame.from, registry, key });
-        }
+        // Hand the newcomer my full CRDT state — anti-entropy on join, so it converges at once.
+        transport.send({
+          kind: 'crdt',
+          from: name,
+          to: frame.from,
+          crdt: crdt.state(),
+          full: true,
+        });
       }
-    } else if (frame.kind === 'join') {
-      memberJoined(frame.group!, frame.from);
-    } else if (frame.kind === 'leave') {
-      memberLeft(frame.group!, frame.from);
-    } else if (frame.kind === 'register') {
-      const rk = `${frame.registry}\u0000${frame.key}`;
-      // I am superseded if I hold this key and a SMALLER-named node now claims it.
-      if (myKeys.has(rk) && frame.from < name) {
-        myKeys.delete(rk);
-        const onConflict = conflictHandlers.get(rk);
-        conflictHandlers.delete(rk);
-        onConflict?.(); // the loser tears down its unit
-      }
-      claim(frame.registry!, frame.key!, frame.from);
-    } else if (frame.kind === 'unregister') {
-      release(frame.registry!, frame.key!, frame.from);
+    } else if (frame.kind === 'crdt') {
+      // A convergent update: a one-op delta (broadcast) or full state (anti-entropy / hello).
+      if (frame.full) crdt.merge(frame.crdt!);
+      else crdt.mergeDelta(frame.crdt!);
+      checkConflicts();
+    } else if (frame.kind === 'sync') {
+      // A peer asked what it is missing (its causal context) — reply with full state iff I know
+      // anything beyond it (otherwise the sync is a no-op).
+      if (crdt.hasBeyond(frame.cc!))
+        dispatch({ kind: 'crdt', from: name, to: frame.from, crdt: crdt.state(), full: true });
     } else if (frame.kind === 'bye') {
       declareDown(frame.from);
     } else if (frame.kind === 'ping') {
@@ -347,7 +390,8 @@ export function start(
   handlers.set('sys.node.info', () => ({
     name,
     peers: [...peers],
-    groups: Object.fromEntries([...groups].map(([g, m]) => [g, [...m]])),
+    groups: allGroups(),
+    registered: crdt.values().length,
     units: [...inspectors].map(([unit, report]) => ({ name: unit, ...report() })),
   }));
 
@@ -360,7 +404,7 @@ export function start(
   const resolveTarget = (to: string): { node: string } | { empty: 'group' | 'via' } => {
     if (to.startsWith('group:')) {
       const group = to.slice('group:'.length);
-      const members = [...(groups.get(group) ?? [])];
+      const members = groupMembersOf(group);
       if (members.length === 0) return { empty: 'group' };
       const at = roundRobin.get(group) ?? 0;
       roundRobin.set(group, at + 1);
@@ -370,8 +414,9 @@ export function start(
       const slash = to.indexOf('/', 'via:'.length);
       const registry = to.slice('via:'.length, slash);
       const key = to.slice(slash + 1);
-      const owner = registries.get(registry)?.get(key);
-      return owner === undefined ? { empty: 'via' } : { node: owner };
+      const owners = ownersOf(registry, key);
+      if (owners.length === 0) return { empty: 'via' };
+      return { node: owners.reduce((a, b) => (a < b ? a : b)) };
     }
     return { node: to };
   };
@@ -379,11 +424,8 @@ export function start(
   // with reconnect) re-announces this node, and peers answer hello, rebuilding list().
   transport.onReopen?.(() => {
     transport.send({ kind: 'hello', from: name });
-    for (const group of myGroups) transport.send({ kind: 'join', from: name, group }); // re-announce
-    for (const rk of myKeys) {
-      const [registry, key] = rk.split('\u0000');
-      transport.send({ kind: 'register', from: name, registry, key });
-    }
+    // Re-push my full CRDT state after a reconnect so peers re-learn my registrations.
+    transport.send({ kind: 'crdt', from: name, crdt: crdt.state(), full: true });
   });
 
   const awaitRef = <R>(
@@ -424,31 +466,40 @@ export function start(
     list: () => [...peers],
     join(group) {
       myGroups.add(group);
-      memberJoined(group, name);
-      transport.send({ kind: 'join', from: name, group });
+      broadcastDelta(crdt.add(gfact(group, name)));
     },
     leave(group) {
       myGroups.delete(group);
-      memberLeft(group, name);
-      transport.send({ kind: 'leave', from: name, group });
+      broadcastDelta(crdt.remove(gfact(group, name)));
     },
-    groupMembers: (group) => [...(groups.get(group) ?? [])],
+    groupMembers: (group) => groupMembersOf(group),
     register(registry, key, onConflict) {
-      const rk = `${registry} ${key}`;
+      const rk = `${registry}\u0000${key}`;
       myKeys.add(rk);
       if (onConflict) conflictHandlers.set(rk, onConflict);
-      claim(registry, key, name);
-      transport.send({ kind: 'register', from: name, registry, key });
+      broadcastDelta(crdt.add(rfact(registry, key, name)));
+      checkConflicts();
     },
     unregister(registry, key) {
-      const rk = `${registry} ${key}`;
+      const rk = `${registry}\u0000${key}`;
       myKeys.delete(rk);
       conflictHandlers.delete(rk);
-      release(registry, key, name);
-      transport.send({ kind: 'unregister', from: name, registry, key });
+      broadcastDelta(crdt.remove(rfact(registry, key, name)));
     },
-    whereis: (registry, key) => registries.get(registry)?.get(key) ?? null,
-    registered: (registry) => [...(registries.get(registry)?.keys() ?? [])],
+    whereis: (registry, key) => {
+      const owners = ownersOf(registry, key);
+      return owners.length ? owners.reduce((a, b) => (a < b ? a : b)) : null;
+    },
+    registered: (registry) => {
+      const prefix = `r\u001f${registry}\u001f`;
+      const keys = new Set(
+        crdt
+          .values()
+          .filter((f) => f.startsWith(prefix))
+          .map((f) => f.slice(prefix.length, f.indexOf('\u001f', prefix.length))),
+      );
+      return [...keys];
+    },
     ping(peer, timeoutMs = 5000) {
       const task = awaitRef<'pong' | 'pang'>(
         timeoutMs,
@@ -461,6 +512,10 @@ export function start(
     monitor(fn) {
       monitors.add(fn);
       return () => monitors.delete(fn);
+    },
+    monitorNodes(fn) {
+      nodeListeners.add(fn);
+      return () => nodeListeners.delete(fn);
     },
     handle: (subject, handler) => void handlers.set(subject, handler),
     call<T>(to: string, subject: string, payload?: unknown, timeoutMs = 5000) {
@@ -512,7 +567,7 @@ export function start(
       // A group cast reaches EVERY member (pg-style broadcast); a via: cast reaches the key's
       // owner; a node cast reaches one node.
       let targets: string[];
-      if (to.startsWith('group:')) targets = [...(groups.get(to.slice('group:'.length)) ?? [])];
+      if (to.startsWith('group:')) targets = groupMembersOf(to.slice('group:'.length));
       else if (to.startsWith('via:')) {
         const resolved = resolveTarget(to);
         targets = 'node' in resolved ? [resolved.node] : [];
@@ -524,6 +579,7 @@ export function start(
       if (!alive) return;
       alive = false;
       clearInterval(tickTimer);
+      clearInterval(syncTimer);
       transport.send({ kind: 'bye', from: name });
       transport.close?.();
     },
@@ -551,6 +607,22 @@ export function start(
       }
     }, everyMs);
     (tickTimer as { unref?: () => void }).unref?.();
+  }
+
+  // Anti-entropy — the CRDT convergence backstop. Periodically ask one peer (round-robin) for
+  // anything we're missing by sending our version vector; the peer replies with full state iff
+  // it holds more. This is what heals a dropped op or a partition, on top of per-op deltas.
+  let syncTimer: ReturnType<typeof setInterval> | undefined;
+  const antiEntropyMs = options.antiEntropyMs;
+  if (antiEntropyMs !== false) {
+    let cursor = 0;
+    syncTimer = setInterval(() => {
+      const list = [...peers];
+      if (list.length === 0) return;
+      const peer = list[cursor++ % list.length];
+      dispatch({ kind: 'sync', from: name, to: peer, cc: crdt.context() });
+    }, antiEntropyMs ?? 10000);
+    (syncTimer as { unref?: () => void }).unref?.();
   }
 
   return nodeHandle;
@@ -622,10 +694,7 @@ export function memoryHub(): { transport(): Transport } {
 export function fromPort(port: {
   postMessage(value: unknown): void;
   on?(event: 'message', handler: (value: unknown) => void): void;
-  // `unknown`, not `{ data: unknown }`: the DOM declares the listener as `(evt: Event) => void`,
-  // and a narrower parameter here makes a real `MessagePort` fail to satisfy this shape under
-  // strictFunctionTypes — the event is read back out below, where the cast belongs.
-  addEventListener?(event: 'message', handler: (event: unknown) => void): void;
+  addEventListener?(event: 'message', handler: (event: { data: unknown }) => void): void;
   close?(): void;
   terminate?(): unknown;
 }): Transport {
@@ -633,10 +702,7 @@ export function fromPort(port: {
     send: (frame) => port.postMessage(frame),
     onFrame(handler) {
       if (port.on) port.on('message', (value) => handler(value as Frame));
-      else
-        port.addEventListener?.('message', (event) =>
-          handler((event as { data: unknown }).data as Frame),
-        );
+      else port.addEventListener?.('message', (event) => handler(event.data as Frame));
     },
     close: () => void (port.close?.() ?? port.terminate?.()),
   };
