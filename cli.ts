@@ -25,6 +25,12 @@ import * as Failure from './lib/result/failure.ts';
 export const UsageFailure: Failure.FailureFactory<'UsageFailure', { detail: string }> =
   Failure.define('UsageFailure', (data: { detail: string }) => data.detail);
 
+// How long `observe` will wait for the peer set to stop growing, and how often it re-reads it.
+// Small on purpose: this is a snapshot command, and the cap is also clamped to the caller's own
+// timeout so `--timeout 100` never spends a second settling.
+const SETTLE_BUDGET_MS = 500;
+const SETTLE_POLL_MS = 25;
+
 const HELP = `actorboy — Elixir/OTP's runtime model on web standards
 
 Usage:
@@ -119,10 +125,10 @@ export async function observe(
     hidden: true, // Erlang's -hidden: read the cluster, stay out of its topology
   });
   try {
-    await node.synced(); // the CRDT context has landed — `list()` is meaningful now
+    await node.synced(); // a peer's full state has landed — `list()` is meaningful now
     // 'known' rather than the default 'visible': an observer wants to see the OTHER observers and
     // tooling nodes attached to this cluster too, which is exactly what hidden peers are.
-    const peers = node.list('known').filter((peer) => peer !== name);
+    const peers = await settledPeers(node, name, timeoutMs);
     const reports = await Task.all(
       peers.map((peer) =>
         node
@@ -135,6 +141,34 @@ export async function observe(
   } finally {
     node.stop();
   }
+}
+
+/**
+ * The peer set once it stops growing.
+ *
+ * `synced()` resolves on the FIRST peer's full state, which is not the same as having met
+ * everyone: on a slow host a second peer's state lands a tick later, so a snapshot taken at
+ * first-sync silently under-reports the cluster — the observer says "1 peer" about a cluster of
+ * two. Anything still arriving is caught by requiring two consecutive unchanged samples, bounded
+ * by a small slice of the caller's own timeout so `observe` stays a snapshot, not a watch.
+ */
+async function settledPeers(
+  node: Node.NodeHandle,
+  self: string,
+  budgetMs: number,
+): Promise<string[]> {
+  const read = () => node.list('known').filter((peer) => peer !== self);
+  const deadline = Date.now() + Math.min(budgetMs, SETTLE_BUDGET_MS);
+  let peers = read();
+  let quiet = 0;
+
+  while (quiet < 2 && Date.now() < deadline) {
+    const before = peers.length;
+    await new Promise((resolve) => setTimeout(resolve, SETTLE_POLL_MS));
+    peers = read();
+    quiet = peers.length === before ? quiet + 1 : 0;
+  }
+  return peers;
 }
 
 async function readTls(cert: string, key: string): Promise<{ cert: string; key: string }> {
