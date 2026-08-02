@@ -62,6 +62,7 @@ export type Result<T, E = Any> = T | E;
  *
  * ```ts
  * import * as Result from './index.ts';
+ *
  * import * as Failure from './failure.ts';
  *
  * const ParseFailure = Failure.define('ParseFailure', (d: { flag: string }) => `bad ${d.flag}`);
@@ -90,18 +91,14 @@ export function unwrap<O>(outcome: O): Exclude<O, Any> {
  *
  * ```ts
  * import * as Result from './index.ts';
- * import * as Failure from './failure.ts';
  *
- * const ConfigDenied = Failure.define('ConfigDenied', (d: { path: string }) => `denied ${d.path}`);
- * const loadConfig = async (
- *   path: string,
- * ): Promise<Result.Result<{ port: number }, Failure.Of<typeof ConfigDenied>>> =>
- *   path.startsWith('/etc/') ? ConfigDenied({ path }) : { port: 8080 };
+ * import { Task } from '../task/task.ts';
  *
- * // Defined, not invoked: a real boot reads the disk. The doctest checks and evaluates the
- * // definition; only a caller would perform the work.
- * async function daemonBoot() {
- *   return Result.expect(await loadConfig('./app.json'), 'daemon could not assemble its config');
+ * // Defined, not invoked: the doctest checks and evaluates the definition; only a caller
+ * // would perform the work.
+ * async function bootSupervisor() {
+ *   const started = Task<{ pid: string }>(() => ({ pid: 'sup@node' }));
+ *   return Result.expect(await started.result(), 'supervisor could not start');
  * }
  * ```
  */
