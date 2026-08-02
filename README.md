@@ -88,6 +88,8 @@ const { values, errors } = await Stream.from(sources)
 
 OTP supervision for in-process JS: the three restart policies, the three strategies, and a
 restart-intensity budget that ends the tree loudly rather than restarting forever.
+`Supervisor.dynamic()` is OTP's `DynamicSupervisor` — children started and stopped at runtime,
+under the same intensity budget.
 
 ```ts
 import * as Supervisor from 'actorboy/supervisor';
@@ -121,9 +123,34 @@ const html = await client.call('worker@ws', 'render', { path: '/' }, 5000);
 ```
 
 Transports: `memoryHub()` (same realm), `fromPort(worker)` (worker threads, iframes,
-`MessagePort`), `wsTransport(url)` (sockets, binary codec by default). The relay server lives
-at `actorboy/node/hub` — the one entry point that needs `ws`, kept out of the main barrel
-so everything else stays browser-safe and dependency-free.
+`MessagePort`), `wsTransport(url)` (sockets, binary codec by default, redialing with
+exponential backoff and re-running the hello handshake on reopen). The relay server lives at
+`actorboy/node/hub` — the one entry point that needs `ws`, kept out of the main barrel so
+everything else stays browser-safe and dependency-free.
+
+### Addressing a service, not a node
+
+`call` takes three kinds of destination, which is what lets an address outlive the machine
+behind it:
+
+| destination            | Elixir counterpart      | semantics                                  |
+| ---------------------- | ----------------------- | ------------------------------------------ |
+| `'worker@ws'`          | a node name             | that node, or a declared `NodeUnreachable`  |
+| `'group:renderers'`    | `:pg` process groups    | round-robin across the group's members      |
+| `'via:rooms/lobby'`    | `{:via, Registry, …}`   | the ONE node that owns that key             |
+
+```ts
+worker.join('renderers'); // membership gossips; a `bye` or a dropped socket prunes it
+await client.call('group:renderers', 'render', { path: '/' }, 5000);
+
+worker.register('rooms', 'lobby'); // one owner per key, smallest node name wins a conflict
+await client.call('via:rooms/lobby', 'chat.post', { text: 'hi' }, 5000);
+```
+
+Registration is deliberately **optimistic** — a synchronous duplicate rejection is impossible
+under gossip lag, so a losing node is told via `onConflict` and tears down what it was serving.
+`rendezvous(key, nodes)` picks the same owner on every caller without any coordination at all
+(HRW hashing: a join or a leave moves ~1/N of keys, not all of them).
 
 ### Hot code upgrades
 
@@ -137,12 +164,22 @@ await client.call('counter@ws', 'counter.sys.upgrade', { url: './counter-v2.ts' 
 
 See [docs/hot-code-upgrades.md](docs/hot-code-upgrades.md).
 
+A served unit has a real mailbox (messages serialize per unit, `gen_server`-style), links and
+`trapExit` for Erlang's exit signals, an optional `Store` seam for persist-before-ack
+durability, `maxMailbox` load shedding, and an observer protocol for `:dbg`-style frame
+tracing.
+
 ## Documentation
 
 - [docs/error-handling.md](docs/error-handling.md) — the full design argument: why the value is
   bare, why the discriminant is a string, the corner cases, the performance measurements, and
   an honest section on when _not_ to use any of this.
 - [docs/hot-code-upgrades.md](docs/hot-code-upgrades.md) — the Erlang↔JS mapping.
+- [examples/fault-tolerant-ledger](examples/fault-tolerant-ledger) — the fault-and-CPU
+  boundary, architected: a supervised worker pool, worker-owned streaming, fail-fast
+  readiness, and a demo that shows what one CPU-bound handler does to a single-threaded node.
+- [examples/realtime-chat](examples/realtime-chat) — the stateful-entity pattern: durable rooms
+  over a `DynamicSupervisor` + `Registry`, rendezvous routing, persist-before-ack.
 - [examples/web-server.ts](examples/web-server.ts) — `node examples/web-server.ts`: a real
   HTTP server against live fs/network edges where the `try`/`catch` keyword appears in exactly
   one function body in the whole program. Deliberately self-contained — it reimplements a
