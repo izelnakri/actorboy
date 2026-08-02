@@ -3,6 +3,6 @@ dist/
 docs/api/
 tmp/
 _site/
-result
+/result
 *.tgz
 *.log
