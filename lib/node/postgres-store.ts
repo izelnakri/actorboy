@@ -10,8 +10,8 @@
 //
 // Leadership uses a `now()`-authority row lease (the DB clock decides expiry, so skewed node clocks
 // can't elect two holders) — no advisory lock is needed, since the CP leadership path is
-// {@link leader} over a raftStore. Verified behaviorally against real Postgres via the opt-in pglite
-// lane (test/pg/*.pg.ts, never in CI); the in-repo tests verify the driver-injection contract.
+// {@link leader} over a raftStore. The examples below exercise the driver-injection contract
+// against a fake executor, which is why neither they nor CI need a database.
 import type { Store } from './upgradable.ts';
 
 /** The one method a driver must expose — run a parameterized query, return the rows. */
@@ -20,7 +20,17 @@ export interface SqlExecutor {
   query<Row = Record<string, unknown>>(text: string, params?: unknown[]): Promise<Row[]>;
 }
 
-/** DDL for the two tables {@link postgresStore} uses — run once at deploy (idempotent). */
+/**
+ * DDL for the two tables {@link postgresStore} uses — run once at deploy (idempotent).
+ *
+ * ```ts
+ * import { postgresStoreSchema } from './postgres-store.ts';
+ *
+ * const ddl = postgresStoreSchema(); // or ({ table: 'jobs', leases: 'jobs_leases' })
+ * ddl.includes('CREATE TABLE IF NOT EXISTS actorboy_store'); // true
+ * ddl.includes('IF NOT EXISTS'); // true — safe to re-run on every deploy
+ * ```
+ */
 export function postgresStoreSchema(options: { table?: string; leases?: string } = {}): string {
   const table = options.table ?? 'actorboy_store';
   const leases = options.leases ?? 'actorboy_leases';
@@ -32,7 +42,33 @@ export function postgresStoreSchema(options: { table?: string; leases?: string }
   );
 }
 
-/** Build a {@link Store} over an injected {@link SqlExecutor}. See {@link postgresStoreSchema}. */
+/**
+ * Build a {@link Store} over an injected {@link SqlExecutor}. See {@link postgresStoreSchema}.
+ *
+ * The driver is the only thing this module does not own, so anything that can run a
+ * parameterized query works — including, here, a Map, which is why this example needs no
+ * database. Swap in `sql.unsafe` or `pool.query` and the same store talks to Postgres.
+ *
+ * ```ts
+ * import { postgresStore } from './postgres-store.ts';
+ *
+ * const rows = new Map<string, unknown>();
+ * const store = postgresStore({
+ *   query: <Row>(text: string, params: unknown[] = []) => {
+ *     const [key, state] = params as [string, string];
+ *     if (text.startsWith('INSERT')) rows.set(key, JSON.parse(state));
+ *     if (text.startsWith('DELETE')) rows.delete(key);
+ *     const hit = text.startsWith('SELECT state') && rows.has(key);
+ *     return Promise.resolve((hit ? [{ state: rows.get(key) }] : []) as Row[]);
+ *   },
+ * });
+ *
+ * await store.save('room:1', { members: 2 });
+ * await store.load('room:1'); // { members: 2 }
+ * await store.clear('room:1');
+ * await store.load('room:1'); // undefined
+ * ```
+ */
 export function postgresStore(
   sql: SqlExecutor,
   options: { table?: string; leases?: string } = {},
