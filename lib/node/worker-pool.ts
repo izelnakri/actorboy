@@ -10,9 +10,28 @@ import { start, fromPort } from './node.ts';
 import { wsTransport } from './ws.ts';
 import { Task } from '../task/task.ts';
 import type { Frame, NodeHandle, Transport } from './node.ts';
-import type { Any as AnyFailure } from '../result/failure.ts';
+import { define, type Any as AnyFailure } from '../result/failure.ts';
 
 type BusSpec = { kind: 'port' } | { kind: 'ws'; url: string };
+
+// Restart intensity, Erlang's `max_restarts`/`max_seconds`: a slot that dies this often this
+// fast is not crashing on a transient, it is crashing on its own code, and re-arming it forever
+// pins the host's event loop open — a pool that can never work also never lets the process exit.
+const MAX_RESTARTS = 3;
+const RESTART_WINDOW_MS = 5_000;
+
+/**
+ * The pool did not come up: fewer threads joined the group than were asked for.
+ *
+ * ```ts
+ * PoolNotReady.is(PoolNotReady({ group: 'cpu', joined: 0, size: 2, ms: 30000 })); // true
+ * ```
+ */
+export const PoolNotReady = define(
+  'PoolNotReady',
+  (data: { group: string; joined: number; size: number; ms: number }) =>
+    `worker pool "${data.group}" had ${data.joined}/${data.size} threads after ${data.ms}ms`,
+);
 
 /**
  * A pool of worker-thread nodes — Elixir's `Task.Supervisor` over a `poolboy` pool. `call`/`cast`
@@ -27,7 +46,7 @@ export interface WorkerPool {
   group: string;
   /** The coordinator node (bridge the pool into a wider cluster through it). */
   node: NodeHandle;
-  /** Settles once every worker thread has booted and joined the group. */
+  /** Settles once every worker thread has booted and joined the group; fails with {@link PoolNotReady}. */
   ready(): Task<void, AnyFailure>;
   /** Terminate the threads and stop the coordinator. */
   stop(): Task<void, AnyFailure>;
@@ -52,6 +71,8 @@ export function workerPool(options: {
   workerData?: unknown;
   hub?: string;
   respawn?: boolean;
+  /** How long `ready()` waits for every thread to join before failing (default 30s). */
+  readyTimeoutMs?: number;
 }): WorkerPool {
   const group = options.group ?? 'workers';
   const id = crypto.randomUUID().slice(0, 8);
@@ -59,6 +80,10 @@ export function workerPool(options: {
   const busSpec: BusSpec = options.hub ? { kind: 'ws', url: options.hub } : { kind: 'port' };
 
   let stopping = false;
+  // Per-slot restart timestamps inside the current window, and the last error a thread reported —
+  // kept so `ready()` can name the thing that actually went wrong instead of only counting.
+  const restarts: number[][] = [];
+  let lastWorkerError: unknown;
   let deliver: ((frame: Frame) => void) | undefined; // LOCAL-mode port-bus inbound sink
   const slots: { name: string; worker: Worker }[] = [];
 
@@ -68,12 +93,25 @@ export function workerPool(options: {
       workerData: { __pool: { name, group, bus: busSpec, data: options.workerData } },
     });
     if (busSpec.kind === 'port') worker.on('message', (frame: Frame) => deliver?.(frame));
+    // Without this listener Node re-throws a worker's error on the HOST thread, so one bad user
+    // handler takes down the whole process — a pool must contain its threads' failures, not
+    // broadcast them. 'exit' still follows, so the restart policy below is what reacts.
+    worker.on('error', (error) => {
+      lastWorkerError = error;
+    });
     worker.on('exit', () => {
       if (stopping) return;
       // LOCAL mode: a dead port can't be detected, so synthesize the worker's `bye` — it drops from
       // liveness and the group. (CLUSTER mode: the hub sees the socket close and does this for us.)
       if (busSpec.kind === 'port') deliver?.({ kind: 'bye', from: name });
-      if (respawn) spawn(i, gen + 1); // re-arm the slot with a fresh generation
+      if (!respawn) return;
+      const now = Date.now();
+      const recent = (restarts[i] ?? []).filter((at) => now - at < RESTART_WINDOW_MS);
+      recent.push(now);
+      restarts[i] = recent;
+      // Over budget: leave the slot dead. `ready()` reports the shortfall, and the host can exit.
+      if (recent.length > MAX_RESTARTS) return;
+      spawn(i, gen + 1); // re-arm the slot with a fresh generation
     });
     slots[i] = { name, worker };
   };
@@ -107,9 +145,20 @@ export function workerPool(options: {
     },
     ready() {
       return Task<void>(async () => {
-        const deadline = Date.now() + 8000;
+        const budget = options.readyTimeoutMs ?? 30_000;
+        const deadline = Date.now() + budget;
         while (coord.groupMembers(group).length < options.size && Date.now() < deadline) {
           await new Promise((r) => setTimeout(r, 15));
+        }
+        // Rejects rather than resolving short. This used to fall out of the loop on the deadline
+        // and report success with an empty pool, so the failure surfaced much later as a call
+        // against a group with no members — or not at all, if the caller only cast.
+        const joined = coord.groupMembers(group).length;
+        if (joined < options.size) {
+          throw PoolNotReady(
+            { group, joined, size: options.size, ms: budget },
+            { cause: lastWorkerError },
+          );
         }
       }).perform(); // eager — starts on call, like the Promise it replaces; composes with .timeout()
     },
