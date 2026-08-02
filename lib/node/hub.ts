@@ -17,6 +17,9 @@
  * ```
  */
 import { WebSocketServer, type WebSocket as WsSocket } from 'ws';
+// Type-only: `Buffer` is a Node global that `deno check` resolves but JSR's public-API type
+// emit does not, so an un-imported reference in an exported signature fails `deno publish`.
+import type { Buffer } from 'node:buffer';
 import { createServer, type Server } from 'node:https';
 import { binaryCodec, type Codec } from './ws.ts';
 import { authDigest, randomNonce, safeEqual } from './auth.ts';
