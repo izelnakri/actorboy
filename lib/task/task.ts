@@ -173,6 +173,10 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * Takes any of the three shapes work arrives in — all lazy, all identical with or without
    * `new`:
    *
+   * - **`null` / `undefined`**, which settle as-is having run nothing. This is what makes the
+   *   cleanup idiom `Task(handle?.close()).ignore('…')` expressible: when the handle is already
+   *   gone there is no promise to adopt and nothing to do, and that is not an error. Both are
+   *   accepted because an absent handle is spelled either way across a codebase.
    * - **recipe**, declaring no parameters — `() => value`, `async () => value`. Whatever it
    *   returns (value or promise) settles the Task. The common case.
    * - **executor**, declaring at least one — `(resolve, reject, signal) => …`, the
@@ -187,7 +191,7 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * an executor must name at least `resolve`. `(...args) => …` and defaulted first parameters
    * both declare zero, so they read as recipes — spell the parameters out to get an executor.
    */
-  constructor(source: PromiseLike<T> | Recipe<T> | Executor<T>) {
+  constructor(source: PromiseLike<T> | Recipe<T> | Executor<T> | null | undefined) {
     let resolve!: (value: T | PromiseLike<T>) => void;
     let reject!: (reason: unknown) => void;
     // A no-op executor: the work does not start here (that is the whole point). We only capture
@@ -265,15 +269,35 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   }
 
   /**
-   * `Promise.prototype.finally`, returning a **Task** — so cleanup no longer drops the chain out
-   * of Task-land the way `then`/`catch` do. Every spec behaviour is kept: `onFinally` takes no
-   * arguments, its return value is discarded, a thenable it returns is awaited, and anything it
-   * throws replaces the outcome.
+   * `Promise.prototype.finally`, returning a **Task** so cleanup does not drop the chain into
+   * plain-Promise land. Every spec behaviour is kept: `onFinally` takes no arguments, its return
+   * value is discarded, a thenable it returns is awaited, and anything it throws replaces the
+   * outcome.
    *
-   * **Eager, like {@link TaskClass#ignore}** — and for the same reason. `finally` is overwhelmingly
-   * written fire-and-forget (`closeWithGrace(...).finally(() => process.exit(143))` in this very
-   * repo), and a lazy one nobody awaits would never run its cleanup. Laziness is right for
-   * building a pipeline; it is wrong for releasing a resource.
+   * **Prefer `try`/`finally` to this.** It exists so that calling it on a Task — which is a real
+   * Promise, so anyone may — behaves sensibly, not because it is the better spelling. A plain
+   * `try`/`finally` inside the recipe is better on every axis:
+   *
+   * ```ts
+   * const acquire = async () => ({ read: async () => 'body', release: () => {} });
+   *
+   * // preferred: lazy, retryable, and the cleanup runs once per attempt
+   * Task(async () => {
+   *   const handle = await acquire();
+   *   try {
+   *     return await handle.read();
+   *   } finally {
+   *     handle.release();
+   *   }
+   * });
+   * ```
+   *
+   * The reason is that this method must be EAGER — `finally` is overwhelmingly written
+   * fire-and-forget (`closeWithGrace(...).finally(() => process.exit(143))`), and a lazy one
+   * nobody awaited would never release. Being eager, it hands back a *running* Task, so
+   * `task.finally(cleanup).retry(3)` leaves the first attempt's rejection unowned and reports an
+   * unhandled rejection. `retry` first, `finally` last — or `try`/`finally`, which cannot be held
+   * wrong this way.
    *
    * ```ts
    * let released = false;
@@ -284,11 +308,6 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * value; // 'body' — the outcome passes through untouched
    * released; // true
    * ```
-   *
-   * Being eager, it carries {@link TaskClass#perform}'s caveat: the returned Task is running, so
-   * if it fails and nothing consumes it, that is an unhandled rejection. `task.finally(cleanup)`
-   * followed only by `.retry()` is the shape to watch — `retry` builds a fresh chain rather than
-   * consuming this one. Put `finally` after the retry, or `.result()` the outcome.
    */
   override finally(onFinally?: (() => void) | null): TaskClass<T, E> {
     return this.#derive<T, E>(
@@ -758,6 +777,26 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   }
 
   /**
+   * Data-first twin of {@link TaskClass#orElse} — a declared failure's fallible second chance.
+   *
+   * ```ts
+   * import { define } from '../result/failure.ts';
+   * const Missed = define('Missed', 'cache miss');
+   *
+   * const cached = Task<string>(() => {
+   *   throw Missed();
+   * });
+   * await Task.orElse(cached, () => Task(() => 'from origin')); // 'from origin'
+   * ```
+   */
+  static orElse<T, E, F>(
+    task: TaskClass<T, E>,
+    fn: (error: E) => TaskClass<T, F> | PromiseLike<T>,
+  ): TaskClass<T, F> {
+    return task.orElse(fn);
+  }
+
+  /**
    * Data-first twin of {@link TaskClass#context} — context for declared failures only.
    *
    * ```ts
@@ -983,6 +1022,50 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   }
 
   /**
+   * The **declared** failure's second chance: on a declared `E`, run `fn` and adopt whatever it
+   * produces — including its failure. Rust's `Result::or_else`, and the fallible twin of
+   * {@link TaskClass#unwrapOr}.
+   *
+   * Two-tier, like `unwrapOr` and unlike {@link TaskClass#recover}: a **bug** is not a planned
+   * outcome and does not get a fallback. "Try the replica when the primary says NotFound" is a
+   * plan; "try the replica when the primary threw a TypeError" is a way to ship the TypeError to
+   * production twice.
+   *
+   * The distinction from `recover` is the return type, and it is the whole point: `recover`
+   * promises no declared failure remains (`E` becomes `never`), so its handler must not have one
+   * to give. `orElse` keeps the channel open, so the fallback is allowed to fail and the caller
+   * still has something to discriminate.
+   *
+   * ```ts
+   * import { define, type Of } from '../result/failure.ts';
+   * const NotFound = define('NotFound', (d: { id: number }) => `no user ${d.id}`);
+   * type NotFoundFailure = Of<typeof NotFound>;
+   *
+   * const fromPrimary = (id: number): Task<string, NotFoundFailure> =>
+   *   Task(() => {
+   *     throw NotFound({ id });
+   *   });
+   * const fromReplica = (id: number): Task<string, NotFoundFailure> => Task(() => `user ${id}`);
+   *
+   * // still a Task<string, NotFoundFailure> — the replica is allowed to miss too
+   * await fromPrimary(7).orElse(() => fromReplica(7)); // 'user 7'
+   * ```
+   */
+  orElse<F>(fn: (error: E) => TaskClass<T, F> | PromiseLike<T>): TaskClass<T, F> {
+    return this.#derive<T, F>(
+      () =>
+        this.then<T, T>(undefined, (error: unknown) => {
+          // A bug belongs to neither branch and keeps rejecting, exactly as it does through
+          // `result`, `match` and `unwrapOr`.
+          if (!isFailure(error)) throw error;
+          failureObserved(error);
+          return fn(error as E);
+        }),
+      (fresh) => fresh.orElse(fn),
+    );
+  }
+
+  /**
    * Recovers by producing a success value — **the crash boundary**, the Task spelling of the
    * one `.catch()` at the top of a program. Sees every rejection, bugs included; everything
    * downstream is settled, so `E` is `never`.
@@ -1000,6 +1083,10 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * ```
    */
   recover<U = T>(fn: (error: unknown) => U | PromiseLike<U>): TaskClass<T | U, never> {
+    // `never` is a claim about the DECLARED channel: no planned failure survives this. It is not
+    // a claim that nothing can reject — a handler that itself throws produces a BUG, and bugs are
+    // untyped everywhere in this API (that is what makes `await` throw `unknown`). When the
+    // fallback has a declared failure of its own to report, that is `orElse`, not `recover`.
     return this.#derive<T | U, never>(
       () =>
         this.then<T | U, T | U>(undefined, (error: unknown) => {
@@ -1210,9 +1297,9 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * ```
    */
   retry(times = 1, options: RetryDelay | RetryOptions = {}): TaskClass<T, E> {
-    const { delayMs, timeoutMs } =
+    const { delayMs, timeoutMs, when } =
       typeof options === 'number' || typeof options === 'function'
-        ? { delayMs: options, timeoutMs: undefined }
+        ? { delayMs: options, timeoutMs: undefined, when: undefined }
         : options;
     // An executor rather than a recipe, so the loop receives the retry Task's own AbortSignal:
     // a `shutdown()` mid-wait has to clear the pending timer, or the delay outlives the Task.
@@ -1229,6 +1316,8 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
         } catch (error) {
           lastReason = error;
           run.#abandon();
+          // Checked before the delay, so an unretryable failure costs nothing extra.
+          if (when !== undefined && !when(error, attempt)) throw error;
         }
         if (attempt < attempts) {
           const wait = typeof delayMs === 'function' ? delayMs(attempt) : (delayMs ?? 0);
@@ -1346,6 +1435,18 @@ export interface RetryOptions {
   /** Deadline for each individual attempt. The attempt is abandoned when it fires — its signal
    *  goes off so cancellation-aware work stops — and counts as a failure like any other. */
   timeoutMs?: number;
+  /**
+   * Which failures are worth another attempt. Returning `false` rethrows immediately, spending
+   * no further attempts and no delay.
+   *
+   * Retrying everything is the wrong default for a KNOWN flake: a genuinely broken call — a
+   * missing binary, a bad profile — gets a pointless second run and the "we only tolerate this
+   * one upstream bug" documentation disappears from the code. This is tokio-retry's `retry_if`
+   * condition. (`backoff` reaches the same place from the other side, by making the error type
+   * say `Transient` or `Permanent`; a predicate is the lighter fit here, because the declared-
+   * vs-bug axis is already what this library's error types encode.)
+   */
+  when?: (error: unknown, attempt: number) => boolean;
 }
 
 /**
@@ -1385,7 +1486,9 @@ function isThenable<T>(value: unknown): value is PromiseLike<T> {
  */
 type TaskConstructor = typeof TaskClass & {
   /** Call form — `Task(source)` without `new`; identical to the constructor. */
-  <T, E = AnyFailure>(source: PromiseLike<T> | Recipe<T> | Executor<T>): TaskClass<T, E>;
+  <T, E = AnyFailure>(
+    source: PromiseLike<T> | Recipe<T> | Executor<T> | null | undefined,
+  ): TaskClass<T, E>;
 };
 
 /**

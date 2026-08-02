@@ -129,6 +129,38 @@ async function until(condition: () => boolean, what: string): Promise<void> {
 }
 
 module('Task | construction forms', { concurrency: true }, () => {
+  // The cleanup idiom depends on this: `Task(handle?.close())` is `Task(undefined)` when the
+  // handle is already gone, and an absent handle is not an error.
+  test('null and undefined settle as-is, having run nothing', async (assert) => {
+    assert.strictEqual(await Task(undefined), undefined);
+    assert.strictEqual(await Task(null), null);
+
+    const slot: { page: { close(): Promise<string> } | null } = { page: null };
+    assert.strictEqual(await Task(slot.page?.close()).ignore('absent handle'), undefined);
+
+    slot.page = { close: () => Promise.resolve('closed') };
+    assert.strictEqual(await Task(slot.page?.close()).ignore('present handle'), 'closed');
+  });
+
+  // Why the call form is the one to reach for on a cleanup: both forms swallow the benign
+  // runtime failure, but only the call form lets a SYNC throw — which for an async API means
+  // the method is gone — reach someone. `ignore` should hide an ECONNRESET, not an upgrade.
+  test('the call form keeps a sync throw visible while still absorbing a rejection', async (assert) => {
+    const rejecting = { close: () => Promise.reject(new Error('ECONNRESET')) };
+    assert.strictEqual(
+      await Task(rejecting.close()).ignore('benign'),
+      undefined,
+      'a rejection is still absorbed',
+    );
+
+    const brokenApi = {
+      close: (): Promise<void> => {
+        throw new TypeError('close is not a function');
+      },
+    };
+    assert.throws(() => Task(brokenApi.close()).ignore('api break'), /close is not a function/);
+  });
+
   test('a recipe settles from its return value — sync, async, and void', async (assert) => {
     assert.strictEqual(await Task(() => 42), 42, 'sync value');
     assert.strictEqual(await new Task(() => 42), 42, 'sync value, new form');
@@ -478,6 +510,56 @@ module('Task | builders', { concurrency: true }, () => {
     assert.strictEqual(started, 2, 'both attempts ran');
     assert.strictEqual(abandoned, 2, 'and each was told when its deadline passed');
     assert.true(AwaitTimeout.is(outcome), 'the deadline is the failure');
+  });
+
+  // Retrying everything is the wrong default for a KNOWN flake: the real failure underneath it
+  // gets a pointless second run, and the "we tolerate exactly this one bug" documentation
+  // disappears from the code. tokio-retry's `retry_if` condition, as an option.
+  test('when() decides which failures are worth another attempt', async (assert) => {
+    let attempts = 0;
+    const failWith = (message: string) =>
+      Task(() => {
+        attempts++;
+        throw new Error(message);
+      });
+    const isKnownFlake = (error: unknown) => /handle is invalid/i.test((error as Error).message);
+
+    attempts = 0;
+    await failWith('handle is invalid')
+      .retry(2, { when: isKnownFlake })
+      .recover(() => null);
+    assert.strictEqual(attempts, 3, 'the known flake spends every attempt');
+
+    attempts = 0;
+    await failWith('ENOENT: no such binary')
+      .retry(2, { when: isKnownFlake })
+      .recover(() => null);
+    assert.strictEqual(attempts, 1, 'anything else surfaces on the first attempt');
+  });
+
+  test('a rejected when() skips the delay as well as the attempt', async (assert) => {
+    const startedAt = Date.now();
+    await Task(() => {
+      throw new Error('permanent');
+    })
+      .retry(3, { delayMs: 500, when: () => false })
+      .recover(() => null);
+
+    assert.true(Date.now() - startedAt < 250, 'no attempt means no wait between attempts either');
+  });
+
+  test('when() receives the attempt number, so it can stop part-way', async (assert) => {
+    const seen: number[] = [];
+    let attempts = 0;
+    await Task(() => {
+      attempts++;
+      throw new Error('flaky');
+    })
+      .retry(5, { when: (_error, attempt) => (seen.push(attempt), attempt < 2) })
+      .recover(() => null);
+
+    assert.deepEqual(seen, [1, 2], 'asked after each failure until it said stop');
+    assert.strictEqual(attempts, 2);
   });
 
   test('a pending wait is abortable, so shutdown during one settles now, not later', async (assert) => {
@@ -1141,6 +1223,36 @@ module('Task | finally', { concurrency: true }, () => {
     assert.true(released, 'a lazy finally would have released nothing here');
   });
 
+  // The reason the docs point at try/finally instead of this method: a plain try/finally inside
+  // the recipe gives the SAME per-attempt cleanup, stays lazy, and builds no extra running Task
+  // to leave unowned. `finally` earns its place only as Promise compatibility.
+  test('try/finally in the recipe matches it, without the eager derived Task', async (assert) => {
+    let attempts = 0;
+    let cleanups = 0;
+    const task = Task(() => {
+      try {
+        if (++attempts < 3) throw new Error('again');
+        return attempts;
+      } finally {
+        cleanups++;
+      }
+    });
+
+    assert.strictEqual(await task.retry(5), 3);
+    assert.strictEqual(cleanups, 3, 'one cleanup per attempt — same as .finally() would give');
+
+    let ran = false;
+    Task(() => {
+      try {
+        ran = true;
+      } finally {
+        /* nothing to release */
+      }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.false(ran, 'and unlike .finally(), it does not start anything on its own');
+  });
+
   test('cleanup re-runs per attempt when the retry is upstream of it', async (assert) => {
     let attempts = 0;
     let cleanups = 0;
@@ -1151,6 +1263,106 @@ module('Task | finally', { concurrency: true }, () => {
 
     assert.strictEqual(await flaky.retry(2).finally(() => cleanups++), 2);
     assert.strictEqual(cleanups, 1, 'one cleanup for the whole retried chain');
+  });
+});
+
+// Rust's `Result::or_else`, and the piece the API was missing: a fallback that is itself
+// allowed to fail. `recover` cannot express it — its `E` is `never`, so it has nowhere to put a
+// failure the handler wants to report.
+module('Task | orElse', { concurrency: true }, () => {
+  test('a declared failure gets the fallback, and the channel stays open', async (assert) => {
+    const primary = Task<{ id: number; name: string }, Failure.Of<typeof NotFound>>(() => {
+      throw NotFound({ id: 7 });
+    });
+
+    const replaced: Task<
+      { id: number; name: string },
+      Failure.Of<typeof NotFound>
+    > = primary.orElse(() => loadUser(7));
+
+    assert.deepEqual(await replaced, { id: 7, name: 'u7' });
+  });
+
+  test('the fallback may fail too, and its failure is still discriminable', async (assert) => {
+    const outcome = await Task<{ id: number; name: string }>(() => {
+      throw NotFound({ id: 7 });
+    })
+      .orElse(() => loadUser(0)) // 0 misses as well
+      .result();
+
+    assert.true(NotFound.is(outcome), 'not swallowed into a value the way recover would');
+    assert.strictEqual(
+      (outcome as Failure.Of<typeof NotFound>).data.id,
+      0,
+      "the FALLBACK's failure",
+    );
+  });
+
+  // The two-tier line, and the reason this is not just `recover` with a different return type:
+  // "retry the replica when the primary says NotFound" is a plan; "retry the replica when the
+  // primary threw a TypeError" ships the TypeError twice.
+  test('a bug gets no fallback — it is not a planned outcome', async (assert) => {
+    let fallbackRan = false;
+    const buggy = Task<number>(() => {
+      throw new TypeError('a real bug');
+    });
+
+    await assert.rejects(
+      buggy.orElse(() => {
+        fallbackRan = true;
+        return Task(() => 0);
+      }),
+      TypeError,
+    );
+    assert.false(fallbackRan, 'the fallback was never reached');
+  });
+
+  test('a success passes through without calling the fallback', async (assert) => {
+    let fallbackRan = false;
+    const value = await Task(() => 'ok').orElse(() => {
+      fallbackRan = true;
+      return Task(() => 'replacement');
+    });
+
+    assert.strictEqual(value, 'ok');
+    assert.false(fallbackRan);
+  });
+
+  test('Task.orElse is the data-first twin', async (assert) => {
+    const failing = Task<string>(() => {
+      throw NotFound({ id: 1 });
+    });
+
+    assert.strictEqual(await Task.orElse(failing, () => Task(() => 'twin')), 'twin');
+  });
+
+  // Both halves must fail for `retry` to have anything to do — a satisfied `orElse` succeeds,
+  // so the chain succeeds and the retry never fires. With both failing, retry has to restart the
+  // SOURCE through the orElse rather than re-read its settled answer.
+  test('lineage survives it — retry restarts the source through the fallback', async (assert) => {
+    let attempts = 0;
+    const flaky = Task<string>(() => {
+      if (++attempts < 3) throw NotFound({ id: attempts });
+      return `ok after ${attempts}`;
+    });
+    const alsoMisses = () =>
+      Task<string>(() => {
+        throw NotFound({ id: 99 });
+      });
+
+    assert.strictEqual(await flaky.orElse(alsoMisses).retry(3), 'ok after 3');
+    assert.strictEqual(attempts, 3, 'the source ran again each time, not the cached rejection');
+  });
+
+  test('a satisfied fallback ends the chain, so an outer retry never fires', async (assert) => {
+    let attempts = 0;
+    const failing = Task<string>(() => {
+      attempts++;
+      throw NotFound({ id: 1 });
+    });
+
+    assert.strictEqual(await failing.orElse(() => Task(() => 'handled')).retry(3), 'handled');
+    assert.strictEqual(attempts, 1, 'nothing to retry once orElse has answered');
   });
 });
 
