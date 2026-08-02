@@ -31,7 +31,7 @@ module('Task | lazy', { concurrency: true }, () => {
       return 2;
     })
       .map((x) => x + 1)
-      .expect('never fails here')
+      .context('never fails here')
       .result();
     assert.false(ran, 'building the whole chain ran nothing');
     assert.strictEqual(await chain, 3, '.result() settles to the bare value');
@@ -50,7 +50,11 @@ module('Task | lazy', { concurrency: true }, () => {
 
   test('a memoria-style lazy relationship fires its RPC only on await', async (assert) => {
     let rpcCount = 0;
-    const posts = () => Task(() => (rpcCount++, [{ id: 1 }, { id: 2 }]));
+    const posts = () =>
+      Task(() => {
+        rpcCount++;
+        return [{ id: 1 }, { id: 2 }];
+      });
     const rel = posts();
     assert.strictEqual(rpcCount, 0, 'accessing the relationship fired no RPC');
     assert.deepEqual(await rel, [{ id: 1 }, { id: 2 }]);
@@ -67,7 +71,10 @@ module('Task | lazy', { concurrency: true }, () => {
 
   test('derived Tasks share the upstream memo — one fetch, many derivations', async (assert) => {
     let fetches = 0;
-    const user = Task(() => (fetches++, { id: 7, name: 'u7' }));
+    const user = Task(() => {
+      fetches++;
+      return { id: 7, name: 'u7' };
+    });
     const name = user.map((u) => u.name);
     const id = user.map((u) => u.id);
     assert.strictEqual(await name, 'u7');
@@ -102,6 +109,193 @@ module('Task | call form', { concurrency: true }, () => {
 
   test('new Task(promise) — the constructor takes the same union', async (assert) => {
     assert.strictEqual(await new Task(Promise.resolve(8)), 8);
+  });
+});
+
+// ── Construction forms — every shape work arrives in, with and without `new` ──
+//
+// One constructor takes all three: a recipe (no parameters), an executor (the `new Promise`
+// shape, told apart by declared arity), and an already-running promise. These tests pin the
+// dispatch rule, because it is the one thing a caller can get wrong silently.
+
+// Polls until `condition` holds — waiting for the state a step depends on rather than
+// sleeping for a duration that may or may not be enough.
+async function until(condition: () => boolean, what: string): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting until ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
+module('Task | construction forms', { concurrency: true }, () => {
+  test('a recipe settles from its return value — sync, async, and void', async (assert) => {
+    assert.strictEqual(await Task(() => 42), 42, 'sync value');
+    assert.strictEqual(await new Task(() => 42), 42, 'sync value, new form');
+    assert.strictEqual(await Task(async () => await Promise.resolve(42)), 42, 'async function');
+    assert.strictEqual(
+      await new Task(async () => await Promise.resolve(42)),
+      42,
+      'async function, new form',
+    );
+    // A recipe returning nothing is a Task<void> that RESOLVES — it must never be mistaken
+    // for an executor still waiting on a resolver it was never handed.
+    assert.strictEqual(await Task(() => {}), undefined, 'void recipe resolves, never hangs');
+  });
+
+  test('an executor settles imperatively — resolve, reject, and the signal third', async (assert) => {
+    assert.strictEqual(await Task<number>((resolve) => resolve(42)), 42);
+    assert.strictEqual(await new Task<number>((resolve) => resolve(42)), 42, 'new form');
+
+    const failed = await Task<number>((_resolve, reject) => reject(NotFound({ id: 7 }))).result();
+    assert.true(Failure.is(failed) && failed.code === 'NotFound', 'reject settles the failure');
+
+    const signals = await Task<boolean>((resolve, _reject, signal) => {
+      resolve(signal instanceof AbortSignal);
+    });
+    assert.true(signals, 'the third parameter is the Task AbortSignal');
+  });
+
+  test('an executor may simply RETURN a promise instead of calling resolve', async (assert) => {
+    // This is the migration path for cancellation-aware work: name the parameters you need,
+    // hand the signal on, and let the returned promise settle the Task.
+    assert.strictEqual(await Task<number>((_resolve, _reject, _signal) => Promise.resolve(7)), 7);
+    // resolve() and a returned promise race; the first settlement wins, as promises always do.
+    const raced = Task<number>((resolve) => {
+      resolve(1);
+      return Promise.resolve(2);
+    });
+    assert.strictEqual(await raced, 1);
+  });
+
+  test('an async executor that throws rejects the Task — the bug native Promise has', async (assert) => {
+    // `new Promise(async () => { throw x })` never settles: the executor's returned promise is
+    // discarded, so the throw escapes as an unhandled rejection and every consumer hangs.
+    // Honouring the returned promise is what closes that hole here.
+    const failed = await Task<string>(async (_resolve) => {
+      await Promise.resolve(); // the throw lands in the async body, not synchronously
+      throw NotFound({ id: 1 });
+    }).result();
+    assert.true(Failure.is(failed) && failed.code === 'NotFound', 'the throw became the failure');
+
+    // And an async executor may still settle through its resolver as usual.
+    assert.strictEqual(
+      await Task<number>(async (resolve) => {
+        await Promise.resolve();
+        resolve(5);
+      }),
+      5,
+    );
+  });
+
+  test('an executor return that is NOT a promise is ignored, exactly as new Promise ignores it', async (assert) => {
+    // The rule earns its keep here: `(resolve) => setTimeout(resolve, ms)` implicitly returns a
+    // timer handle. Honouring non-promise returns would settle the Task with that handle
+    // immediately — breaking the commonest executor idiom there is.
+    const started = Date.now();
+    const slept = await Task<string>((resolve) => setTimeout(() => resolve('slept'), 40));
+    assert.strictEqual(slept, 'slept', 'the timer settled it, not the returned handle');
+    assert.true(Date.now() - started >= 35, 'and it genuinely waited');
+
+    // The corollary: a plain value must go through the resolver, which accepts either.
+    const maybe = (n: number): number | Promise<number> => (n > 0 ? n : Promise.resolve(0));
+    assert.strictEqual(await Task<number>((resolve) => resolve(maybe(5))), 5, 'plain value');
+    assert.strictEqual(await Task<number>((resolve) => resolve(maybe(-1))), 0, 'promise');
+  });
+
+  test('a promise source works in both spellings, deferring only observation', async (assert) => {
+    assert.strictEqual(await Task(Promise.resolve(5)), 5);
+    assert.strictEqual(await new Task(Promise.resolve(9)), 9);
+  });
+
+  test('both function shapes stay lazy — nothing runs until awaited', (assert) => {
+    let recipeRan = 0;
+    let executorRan = 0;
+    Task(() => {
+      recipeRan++;
+      return 1;
+    });
+    Task<number>((resolve) => {
+      executorRan++;
+      resolve(1);
+    });
+    assert.strictEqual(recipeRan, 0, 'the recipe did not run');
+    assert.strictEqual(executorRan, 0, 'the executor did not run either — unlike new Promise');
+  });
+
+  test('perform() starts an executor synchronously, so an event bridge cannot miss its event', async (assert) => {
+    let subscribed = false;
+    const task = Task<string>((resolve) => {
+      subscribed = true;
+      queueMicrotask(() => resolve('frame'));
+    });
+    assert.false(subscribed, 'still lazy before perform');
+    task.perform();
+    assert.true(subscribed, 'subscribed synchronously — the event cannot land first');
+    assert.strictEqual(await task, 'frame');
+  });
+
+  test('every retry of an executor gets FRESH resolvers, so a stale one cannot cross-settle', async (assert) => {
+    let attempt = 0;
+    const resolvers: ((value: number) => void)[] = [];
+    const flaky = Task<number>((resolve, reject) => {
+      resolvers.push(resolve);
+      attempt += 1;
+      if (attempt < 3) reject(new Error(`attempt ${attempt}`));
+      else resolve(attempt);
+    });
+
+    assert.strictEqual(await flaky.retry(3), 3, 'succeeded on the third fresh execution');
+    assert.strictEqual(new Set(resolvers).size, resolvers.length, 'no resolver was ever reused');
+    // The classic executor hazard: a callback captured during attempt 1 fires late. It settles
+    // the attempt it belonged to — which nothing awaits — so the outcome here cannot change.
+    resolvers[0](999);
+    assert.strictEqual(await flaky.restart(), 4, 'the stale resolve() was inert');
+  });
+
+  test('a stale resolver from an earlier attempt cannot settle a later one', async (assert) => {
+    // The dangling-resolver worry: attempt 1 subscribes something that closes over ITS
+    // resolve, fires late, and settles the wrong attempt. It cannot — every restart binds
+    // fresh resolvers to its own promise, and attempt 1's promise already rejected, so
+    // invoking its resolver is a no-op on a settled promise.
+    const listeners: Array<(value: number) => void> = [];
+    let attempt = 0;
+    const task = Task<string>((resolve, reject) => {
+      const mine = ++attempt;
+      listeners.push((value) => resolve(`attempt${mine}-saw-${value}`));
+      if (mine === 1) reject(new Error('attempt 1 failed'));
+    });
+
+    const settled = task.retry(1).perform();
+    await until(() => listeners.length === 2, 'both attempts have subscribed');
+    listeners.forEach((fire) => fire(7)); // the STALE one first
+
+    assert.strictEqual(await settled, 'attempt2-saw-7', 'the live attempt settled it');
+  });
+
+  test('an attempt retry abandons has its signal fired, so it can clean up', async (assert) => {
+    // Abandoned work gets no second chance to tidy up on its own, and the executor is the
+    // only shape that can be told — it is the one that receives the signal.
+    const cleaned: string[] = [];
+    let attempt = 0;
+    const root = Task<number>((resolve, reject, signal) => {
+      const mine = ++attempt;
+      signal.addEventListener('abort', () => cleaned.push(`attempt${mine}`));
+      if (mine < 3) reject(new Error(`fail ${mine}`));
+      else resolve(mine);
+    });
+
+    // Retried through a derived chain: the work lives at the root, so abandoning has to
+    // walk the lineage to reach it.
+    assert.strictEqual(await root.map((value) => value * 10).retry(3), 30);
+    assert.deepEqual(cleaned, ['attempt1', 'attempt2'], 'each abandoned attempt was told');
+  });
+
+  test('arity is what selects the shape — rest and defaulted parameters read as recipes', async (assert) => {
+    // `fn.length` ignores rest and defaulted parameters, so both declare zero and are recipes.
+    // Spelling the parameters out is what asks for an executor.
+    assert.strictEqual(await Task((..._args: unknown[]) => 3), 3, 'rest params: a recipe');
+    assert.strictEqual(await Task(() => 4), 4);
   });
 });
 
@@ -228,9 +422,129 @@ module('Task | builders', { concurrency: true }, () => {
     await assert.rejects(Task.fail(NotFound({ id: 7 })), /no user 7/);
   });
 
-  test('Task.from lifts a promise or a recipe', async (assert) => {
-    assert.strictEqual(await Task.from(Promise.resolve(5)), 5);
-    assert.strictEqual(await Task.from(() => 6), 6);
+  test('retry waits between attempts — a constant, or a function of the attempt', async (assert) => {
+    let runs = 0;
+    const flaky = () =>
+      Task(() => {
+        runs += 1;
+        if (runs % 3 !== 0) throw NotFound({ id: runs });
+        return runs;
+      });
+
+    runs = 0;
+    const started = Date.now();
+    await flaky().retry(2, 20);
+    // Lower bound only: two gaps of 20ms must have elapsed. No upper bound — a loaded runner
+    // may take much longer, and asserting that it did not is how timing tests go flaky.
+    assert.true(Date.now() - started >= 40, 'two waits of 20ms happened between three attempts');
+
+    runs = 0;
+    const seen: number[] = [];
+    await flaky().retry(2, (attempt) => {
+      seen.push(attempt);
+      return 1;
+    });
+    assert.deepEqual(seen, [1, 2], 'the backoff fn is called once per gap, with a 1-based attempt');
+
+    // And no wait at all remains the default, as it always was.
+    runs = 0;
+    assert.strictEqual(await flaky().retry(2), 3, 'retry(times) alone still retries immediately');
+  });
+
+  test('retry bounds each attempt with timeoutMs, abandoning the one that overran', async (assert) => {
+    let started = 0;
+    let abandoned = 0;
+    const neverSettles = Task<number>((_resolve, _reject, signal) => {
+      started += 1;
+      signal.addEventListener('abort', () => (abandoned += 1));
+    });
+
+    const outcome = await neverSettles.retry(1, { timeoutMs: 20 }).result();
+
+    assert.strictEqual(started, 2, 'both attempts ran');
+    assert.strictEqual(abandoned, 2, 'and each was told when its deadline passed');
+    assert.true(
+      Failure.is(outcome) && outcome.code === 'AwaitTimeout',
+      'the deadline is the failure',
+    );
+  });
+
+  test('a pending wait is abortable, so shutdown during one settles now, not later', async (assert) => {
+    // The leak this guards: an un-abortable sleep would hold its timer — and the Task — for the
+    // full delay. Asserted by observable settling rather than a process-wide handle count,
+    // which concurrent test modules would make flaky.
+    let runs = 0;
+    const task = Task(() => {
+      runs += 1;
+      throw NotFound({ id: runs });
+    })
+      .retry(5, 60_000) // a wait far longer than any test would tolerate
+      .perform();
+
+    await until(() => runs > 0, 'the first attempt has failed and the wait has begun');
+    const startedAt = Date.now();
+    await task.shutdown(200);
+
+    assert.true(Date.now() - startedAt < 2_000, 'shutdown did not wait out the 60s delay');
+    assert.true(Failure.is(await task.result()), 'and the Task settled rather than hanging');
+  });
+
+  test('a failing Task fits where its value type is declared — Task stays covariant in T', async (assert) => {
+    // A private field carrying `T` in a parameter position would make the class invariant, and
+    // `Task.fail(...)` — whose type is `Task<never, F>` — would stop being assignable to the
+    // `Task<Value, F>` a guard clause returns. Native Promise is covariant; so is this. The
+    // assertions below are the runtime half; the compile-time half is that this file builds.
+    type Config = { port: number };
+    const load = (exists: boolean): Task<Config, Failure.Of<typeof NotFound>> => {
+      if (!exists) return Task.fail(NotFound({ id: 0 })); // the pattern Task.fail exists for
+      return Task(() => ({ port: 8080 }));
+    };
+
+    assert.deepEqual(await load(true), { port: 8080 }, 'the happy path still carries the value');
+    const failed = await load(false).result();
+    assert.true(Failure.is(failed) && failed.code === 'NotFound', 'the guard clause failed');
+
+    // A recipe that only ever throws is `Task<never, …>` too, and fits the same contract.
+    const throwsOnly = (): Task<Config, Failure.Of<typeof NotFound>> =>
+      Task(() => {
+        throw NotFound({ id: 1 });
+      });
+    assert.true(Failure.is(await throwsOnly().result()), 'and so does an always-throwing recipe');
+  });
+
+  test('Task.result takes a foreign promise as well as a Task', async (assert) => {
+    // The twin is most useful over a value someone handed you, and that is usually a promise.
+    // Before it was widened, `Task.result(promise)` was a type error — and a TypeError at
+    // runtime if it reached there from untyped JS, since it delegated straight to .result().
+    assert.strictEqual(await Task.result(Task(() => 21 * 2)), 42, 'a Task, as before');
+    assert.strictEqual(await Task.result(Promise.resolve(7)), 7, 'and a plain promise');
+
+    // A rejecting promise lands on the failure channel, exactly as a Task's would.
+    const failed = await Task.result(Promise.reject(NotFound({ id: 1 })) as Promise<number>);
+    assert.true(Failure.is(failed) && failed.code === 'NotFound', 'the rejection is the Err half');
+
+    // A bug still flies past — widening the input did not widen what result() absorbs.
+    await assert.rejects(
+      Task.result(Promise.reject(new TypeError('bug')) as Promise<number>),
+      TypeError,
+    );
+  });
+
+  test('Task.resolve passes an existing Task through, so its lineage survives', async (assert) => {
+    // `Promise.resolve(p)` returns p itself for a same-constructor promise. Wrapping instead
+    // would hand back a Task whose restart re-awaits the settled inner one rather than
+    // re-running its work — the combinator hole, one layer down.
+    let runs = 0;
+    const inner = Task(() => ++runs);
+    assert.strictEqual(Task.resolve(inner), inner, 'the same instance, not a wrapper');
+
+    assert.strictEqual(await Task.resolve(inner), 1);
+    assert.strictEqual(await Task.resolve(inner).restart(), 2, 'restart still reaches the work');
+
+    // A plain value — and a plain FUNCTION — are still lifted as values, never run.
+    assert.strictEqual(await Task.resolve(42), 42);
+    const fn = () => 'not called';
+    assert.strictEqual(typeof (await Task.resolve(fn)), 'function', 'a function stays a value');
   });
 
   test('Task.try carries arguments and stays lazy — Promise.try made lazy', async (assert) => {
@@ -310,7 +624,7 @@ module('Task | combinators', { concurrency: true }, () => {
     await assert.rejects(Task.results([loadUser(1), buggy]), TypeError);
   });
 
-  test('combinators snapshot a one-shot iterable — restart() re-awaits the same members', async (assert) => {
+  test('combinators snapshot a one-shot iterable, so restart() still sees every member', async (assert) => {
     function* gen() {
       yield Task(() => 1);
       yield Task(() => 2);
@@ -320,6 +634,50 @@ module('Task | combinators', { concurrency: true }, () => {
     // Without the snapshot, restart() re-iterates the exhausted generator and resolves [].
     assert.deepEqual(await all.restart(), [1, 2]);
     assert.deepEqual(await Task.results(gen()).restart(), [1, 2]);
+  });
+
+  test('restart re-runs the members themselves, so retry over a combinator retries the work', async (assert) => {
+    // A combinator has no single source to walk, so without this it rebuilt nothing: restart
+    // re-awaited members that had already settled and `Task.all(...).retry()` did no work at
+    // all — the lineage promise ("a fresh execution of the whole chain") stopped at the
+    // combinator's edge.
+    let runs = 0;
+    const member = () => Task(() => ++runs);
+
+    const all = Task.all([member(), member()]);
+    assert.deepEqual(await all, [1, 2]);
+    assert.deepEqual(await all.restart(), [3, 4], 'both members ran again');
+
+    // Through a derivation, which is how call sites actually use it.
+    runs = 0;
+    const chained = Task.all([member(), member()]).map((values) => values.join('+'));
+    assert.strictEqual(await chained, '1+2');
+    assert.strictEqual(await chained.restart(), '3+4', 'the chain reached the members');
+
+    // And for every combinator, not just `all`.
+    runs = 0;
+    const raced = Task.race([member()]);
+    await raced;
+    assert.strictEqual(await raced.restart(), 2, 'race');
+    runs = 0;
+    const settled = Task.allSettled([member()]);
+    await settled;
+    assert.deepEqual(await settled.restart(), [{ status: 'fulfilled', value: 2 }], 'allSettled');
+    runs = 0;
+    const outcomes = Task.results([member()]);
+    await outcomes;
+    assert.deepEqual(await outcomes.restart(), [2], 'results');
+  });
+
+  test('a plain promise member is passed through — it has no second execution to give', async (assert) => {
+    // Honest limit: a promise is already running, so a combinator over promises restarts the
+    // combination, never the work behind it. Only Task members carry a recipe to re-run.
+    let started = 0;
+    const promise = (): Promise<number> => Promise.resolve(++started);
+    const all = Task.all([promise(), promise()]);
+    assert.deepEqual(await all, [1, 2]);
+    assert.deepEqual(await all.restart(), [1, 2], 'the same settled promises, re-awaited');
+    assert.strictEqual(started, 2, 'nothing ran a second time');
   });
 });
 
@@ -359,6 +717,45 @@ module('Task | transforming', { concurrency: true }, () => {
     await assert.rejects(remapBug, /kind: TypeError/);
   });
 
+  test('mapErr takes a failure factory directly, chaining the cause for you', async (assert) => {
+    // Before the overload this exact line compiled and misbehaved: a factory's first parameter
+    // is its payload, so the raw error landed in `data` and the cause chain was lost.
+    const Unreadable = Failure.define(
+      'Unreadable',
+      (d: { path: string }) => `cannot read ${d.path}`,
+    );
+    const Denied = Failure.define('Denied', 'permission denied');
+    const foreign = () => Task<string>(() => Promise.reject(new Error('EACCES')));
+
+    const withPayload = await foreign().mapErr(Unreadable, { path: '/etc/app.json' }).result();
+    assert.true(Failure.is(withPayload) && withPayload.code === 'Unreadable', 'the declared code');
+    assert.deepEqual(
+      (withPayload as Failure.Of<typeof Unreadable>).data,
+      { path: '/etc/app.json' },
+      'the payload is the payload — not the error that was caught',
+    );
+    assert.strictEqual(
+      ((withPayload as Failure.Any).cause as Error).message,
+      'EACCES',
+      'and the original is chained under cause',
+    );
+
+    // A factory with nothing to carry needs no second argument.
+    const bare = await foreign().mapErr(Denied).result();
+    assert.true(Failure.is(bare) && bare.code === 'Denied', 'the bare factory form');
+    assert.strictEqual(((bare as Failure.Any).cause as Error).message, 'EACCES', 'still chained');
+
+    // The function form is untouched, and is still the only one that can read the cause.
+    const derived = await foreign()
+      .mapErr((cause) => Unreadable({ path: (cause as Error).message }, { cause }))
+      .result();
+    assert.deepEqual((derived as Failure.Of<typeof Unreadable>).data, { path: 'EACCES' });
+
+    // And the factory form survives a restart, like every other derivation.
+    const restarted = await foreign().mapErr(Denied).restart().result();
+    assert.true(Failure.is(restarted) && restarted.code === 'Denied', 'lineage keeps the shape');
+  });
+
   test('recover is the crash boundary: it catches declared failures AND bugs', async (assert) => {
     assert.deepEqual(await loadUser(0).recover(() => ({ id: -1, name: 'guest' })), {
       id: -1,
@@ -382,7 +779,7 @@ module('Task | two-tier', { concurrency: true }, () => {
 
   test('expect adds context to a declared failure, preserving code and data', async (assert) => {
     try {
-      await loadUser(0).expect('the run needs a user here');
+      await loadUser(0).context('the run needs a user here');
       assert.true(false, 'unreachable');
     } catch (error) {
       assert.true(NotFound.is(error), 'same code — every switch on it still works');
@@ -394,7 +791,7 @@ module('Task | two-tier', { concurrency: true }, () => {
   });
 
   test('expect lets a bug pass through uncontextualised', async (assert) => {
-    await assert.rejects(buggy().expect('context that must NOT wrap a bug'), TypeError);
+    await assert.rejects(buggy().context('context that must NOT wrap a bug'), TypeError);
   });
 
   test('unwrapOr substitutes only for declared failures; a bug still rejects', async (assert) => {
@@ -443,7 +840,7 @@ module('Task | retry & restart', { concurrency: true }, () => {
     // re-ran only the derivation and served the source from its memo.
     let fetches = 0;
     const user = Task(() => ({ id: 7, name: 'u' + ++fetches }));
-    const chain = user.map((u) => u.name).expect('user must load');
+    const chain = user.map((u) => u.name).context('user must load');
     assert.strictEqual(await chain, 'u1');
     assert.strictEqual(fetches, 1);
     assert.strictEqual(await chain.restart(), 'u2', 'the fetch itself re-ran');
@@ -523,7 +920,7 @@ module('Task | data-first statics', { concurrency: true }, () => {
       name: 'guest',
     });
     try {
-      await Task.expect(loadUser(0), 'twin context');
+      await Task.context(loadUser(0), 'twin context');
       assert.true(false, 'unreachable');
     } catch (error) {
       assert.strictEqual((error as Error).message, 'twin context');
@@ -703,7 +1100,10 @@ module('Task | ensure', { concurrency: true }, () => {
 module('Task | elixir family', () => {
   test('async starts NOW; await joins with a deadline', async (assert) => {
     let ran = false;
-    const task = Task.async(() => ((ran = true), 21 * 2));
+    const task = Task.async(() => {
+      ran = true;
+      return 21 * 2;
+    });
     assert.true(ran, 'async performed immediately — the async half of the pair');
     assert.strictEqual(await task.await(1000), 42);
   });
@@ -740,12 +1140,14 @@ module('Task | elixir family', () => {
 
   test('shutdown fires the recipe signal; cancellation-aware work stops', async (assert) => {
     let aborted = false;
-    const task = Task<number>(
-      (signal) =>
-        new Promise<never>((_res, rej) => {
-          signal.addEventListener('abort', () => ((aborted = true), rej(signal.reason)));
-        }),
-    ).perform();
+    // The executor form IS the cancellation-aware shape: no `new Promise` wrapper, because the
+    // Task hands over its own resolvers.
+    const task = Task<number>((_resolve, reject, signal) => {
+      signal.addEventListener('abort', () => {
+        aborted = true;
+        reject(signal.reason);
+      });
+    }).perform();
     const outcome = await task.shutdown(50);
     assert.true(aborted, 'the AbortSignal reached the recipe');
     assert.true(outcome === null || Failure.is(outcome), 'nothing useful had landed');
@@ -755,7 +1157,10 @@ module('Task | elixir family', () => {
 
   test('shutdown of a never-started task settles it without running the recipe', async (assert) => {
     let ran = false;
-    const task = Task(() => ((ran = true), 1));
+    const task = Task(() => {
+      ran = true;
+      return 1;
+    });
     assert.strictEqual(await task.shutdown(10), null);
     assert.false(ran, 'the recipe never ran');
     assert.true(Failure.is(await task.result()), 'consumers see Shutdown, not a hang');

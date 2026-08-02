@@ -4,8 +4,41 @@ import {
   ignore as failureIgnore,
   observed as failureObserved,
   isFailure,
+  isFactory,
   type Any as AnyFailure,
+  type Failure as FailureOf,
+  type FailureFactory,
 } from '../result/failure.ts';
+
+/**
+ * The zero-parameter shape: return the value (or a promise of it) and that settles the Task.
+ * Declared with no parameters both because that is what it receives and because it is what
+ * lets TypeScript tell a recipe from an {@link Executor} — a lambda naming even one parameter
+ * can then only be the executor, so `resolve` gets contextually typed instead of `any`.
+ * A recipe that needs the `AbortSignal` takes the executor shape.
+ */
+export type Recipe<T> = () => T | PromiseLike<T>;
+
+/**
+ * The `new Promise` shape, made lazy: settle imperatively through `resolve`/`reject`, with the
+ * Task's `AbortSignal` third.
+ *
+ * Returning a **promise** settles the Task as well (whichever lands first wins), which is what
+ * lets `(_, __, signal) => fetch(url, { signal })` skip the resolver entirely. Any **other**
+ * return value is ignored, exactly as `new Promise` ignores it — otherwise the commonest
+ * executor idiom of all, `(resolve) => setTimeout(resolve, 100)`, would settle the Task
+ * instantly with a timer handle. To settle with something that might not be a promise, hand it
+ * to the resolver: `(resolve) => resolve(maybeAPromise)`.
+ *
+ * Honouring the promise also closes a hole the platform leaves open: `new Promise(async () => {
+ * throw x })` discards the executor's promise, so the throw escapes as an unhandled rejection
+ * and the promise never settles. Here it simply becomes the Task's failure.
+ */
+export type Executor<T> = (
+  resolve: (value: T | PromiseLike<T>) => void,
+  reject: (reason?: unknown) => void,
+  signal: AbortSignal,
+) => unknown;
 
 /**
  * `Task<T, E>` — a **lazy, retryable** superset of `Promise<T>` for error handling that respects
@@ -17,8 +50,9 @@ import {
  * `Failure` — which one `Failure.is()` check discriminates.
  *
  * A `Task` is a real `Promise` (`instanceof Promise` holds, and the Promises/A+ suite passes —
- * see test/task/promises-aplus.ts) built from a **recipe** — a thunk `() => T | PromiseLike<T>`
- * — that runs **only when the Task is first awaited** (or `.then`-ed, or {@link TaskClass#perform}-ed).
+ * see test/task/promises-aplus.ts) built from **work** — a {@link Recipe} `() => value`, an
+ * {@link Executor} `(resolve, reject, signal) => …`, or a promise already running — that starts
+ * **only when the Task is first awaited** (or `.then`-ed, or {@link TaskClass#perform}-ed).
  * A failure is a real **rejection** whose reason is a `Failure`. Those two choices are what make
  * it work *with* the language:
  *
@@ -28,19 +62,28 @@ import {
  *    wrapper shape lives behind one method, {@link TaskClass#result}.)
  *  - `Promise.all`/`race`/`any` fail-fast; `try`/`catch` handles it; `instanceof Promise` holds.
  *  - Because it is lazy, a relationship accessor can fire its RPC only on `await`; because every
- *    Task keeps its recipe **and its derivation lineage**, {@link TaskClass#retry}/
- *    {@link TaskClass#restart} spawn fresh executions of the *whole chain* (the
- *    ember-concurrency model — a Promise instance settles once, but the Task re-runs).
+ *    Task keeps its work **and its derivation lineage**, {@link TaskClass#retry}/
+ *    {@link TaskClass#restart} spawn fresh executions of the *whole chain* — including a
+ *    combinator's members (the ember-concurrency model: a Promise instance settles once, but the
+ *    Task re-runs). `retry` takes a delay, or a function of the attempt for backoff, and can
+ *    bound each attempt; every attempt it abandons has its `AbortSignal` fired so subscriptions
+ *    can be released.
  *
  * The two-tier rule threads through every consuming method: a **declared failure** (a `Failure`)
  * is an outcome the caller planned for, a **bug** (any other rejection) is not. `result`,
  * `match`, `unwrapOr` and `expect` act only on declared failures and let bugs keep flying to the
  * one boundary that turns them into a crash report; `mapErr` (the adapter edge, where foreign
  * errors get classified *into* Failures) and `recover` (the crash boundary itself) are the two
- * deliberate catch-alls.
+ * deliberate catch-alls. `mapErr` takes a {@link define}d factory directly — `mapErr(Unreadable,
+ * { path })` — chaining the original under `cause`, or a `(cause) => Failure` function when the
+ * payload has to be read out of the error being classified.
  *
- * Construction is `Task(recipe)` or `new Task(recipe)` — the exported value is call-or-construct,
- * like `Boolean`/`Date`, because a factory reads better at the end of an adapter:
+ * Construction takes work in whichever shape it already has — a {@link Recipe} (`() => value`),
+ * an {@link Executor} (`(resolve, reject, signal) => …`, the `new Promise` shape made lazy), or
+ * a promise that is already running — with or without `new`, since the exported value is
+ * call-or-construct like `Boolean`/`Date`. The executor's parameters are ordered exactly as the
+ * platform's, so an existing `new Promise` body can move into a Task unchanged, with the
+ * `AbortSignal` appended where the platform has nothing:
  *
  * ```ts
  * import { define, type Of } from '../result/failure.ts';
@@ -59,33 +102,59 @@ import {
  * @see docs/error-handling.md
  */
 class TaskClass<T, E = AnyFailure> extends Promise<T> {
-  /** The recipe. Runs at most once per instance (memoised); kept so retry/restart can re-run it.
-   *  It receives an AbortSignal — most recipes ignore it; cancellation-aware ones (a fetch, a
-   *  DB query) pass it on, which is what makes {@link TaskClass#shutdown} able to stop work. */
-  #recipe: (signal: AbortSignal) => T | PromiseLike<T>;
+  /** The work. Runs at most once per instance (memoised); kept so retry/restart can re-run it.
+   *  Either a **recipe** (`() => value`) or an **executor** (`(resolve, reject, signal) => …`),
+   *  told apart by declared arity — see {@link TaskClass#constructor}. */
+  #work: Recipe<T> | Executor<T>;
   #started = false;
   #controller: AbortController | undefined;
-  #resolve!: (value: T | PromiseLike<T>) => void;
+  /** Typed `unknown` rather than `T` on purpose. A private field is checked structurally, so
+   *  putting `T` in a parameter position here would make the whole class INVARIANT in `T` —
+   *  and `Task.fail(...)`, whose type is `Task<never, F>`, would stop being assignable to the
+   *  `Task<Value, F>` a guard clause returns. Native Promise has no such field and stays
+   *  covariant; this keeps Task the same. Only values this class produced ever reach it. */
+  #resolve!: (value: unknown) => void;
   #reject!: (reason: unknown) => void;
   /** Derivation lineage: the Task this one was derived from, and how to re-derive it — what
    *  makes restart/retry on a *chain* re-execute the chain's source, not just the last step. */
   #source: TaskClass<unknown, unknown> | undefined;
   #rederive: ((fresh: TaskClass<unknown, unknown>) => TaskClass<T, E>) | undefined;
+  /** Rebuilds a combinator over freshly restarted members. A combinator has no single source
+   *  to walk, so this is how `restart` reaches the work its members represent. */
+  #remake: (() => TaskClass<T, E>) | undefined;
 
-  /** Takes a recipe (lazy — runs on first await), or an already-running promise (the Task
-   *  then defers only *observation*). Never an executor — that is what makes it constructible
-   *  around work instead of inside it. */
-  constructor(source: PromiseLike<T> | ((signal: AbortSignal) => T | PromiseLike<T>)) {
+  /**
+   * Takes any of the three shapes work arrives in — all lazy, all identical with or without
+   * `new`:
+   *
+   * - **recipe**, declaring no parameters — `() => value`, `async () => value`. Whatever it
+   *   returns (value or promise) settles the Task. The common case.
+   * - **executor**, declaring at least one — `(resolve, reject, signal) => …`, the
+   *   `new Promise` shape, so callback/event APIs settle a Task imperatively. Unlike
+   *   `new Promise` it runs **lazily** (on first await/`perform`), gets an `AbortSignal` third
+   *   for {@link TaskClass#shutdown}, and re-runs with *fresh* resolvers on every
+   *   {@link TaskClass#restart}. A returned promise settles the Task too, so
+   *   `(_, __, signal) => fetch(url, { signal })` needs no resolver call at all.
+   * - **promise**, already running — the Task then defers only *observation*.
+   *
+   * The two function shapes are told apart by **declared arity** (`fn.length`), which is why
+   * an executor must name at least `resolve`. `(...args) => …` and defaulted first parameters
+   * both declare zero, so they read as recipes — spell the parameters out to get an executor.
+   */
+  constructor(source: PromiseLike<T> | Recipe<T> | Executor<T>) {
     let resolve!: (value: T | PromiseLike<T>) => void;
     let reject!: (reason: unknown) => void;
     // A no-op executor: the work does not start here (that is the whole point). We only capture
-    // the resolving functions; the recipe runs later, in `#start`, on the first `.then`.
+    // the resolving functions; `#work` runs later, in `#start`, on the first `.then`.
     super((res, rej) => {
       resolve = res;
       reject = rej;
     });
-    this.#recipe = typeof source === 'function' ? source : () => source;
-    this.#resolve = resolve;
+    // A promise source becomes a zero-parameter recipe, so `#work`'s own arity stays the
+    // single source of truth for which shape it is — nothing extra to store, and nothing to
+    // keep in sync when `restart()` carries the work to a fresh Task.
+    this.#work = typeof source === 'function' ? (source as Recipe<T> | Executor<T>) : () => source;
+    this.#resolve = resolve as (value: unknown) => void;
     this.#reject = reject;
   }
 
@@ -101,11 +170,27 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   #start(): void {
     if (this.#started) return;
     this.#started = true;
-    this.#controller ??= new AbortController();
+    const work = this.#work;
     try {
-      Promise.resolve(this.#recipe(this.#controller.signal)).then(this.#resolve, this.#reject);
+      if (work.length === 0) {
+        // The common shape. A recipe declares no parameters, so it can never observe the
+        // signal — the AbortController is left uncreated until `shutdown` actually asks for
+        // one, which keeps the ordinary path free of it entirely.
+        Promise.resolve((work as Recipe<T>)()).then(this.#resolve, this.#reject);
+      } else {
+        // The executor settles THIS Task's own resolvers — no intermediate promise, so the
+        // imperative shape costs less than the `new Promise` it replaces. A returned promise
+        // is honoured as well; whichever settles first wins, as promises always do.
+        this.#controller ??= new AbortController();
+        const returned = (work as Executor<T>)(
+          this.#resolve,
+          this.#reject,
+          this.#controller.signal,
+        );
+        if (isThenable<T>(returned)) returned.then(this.#resolve, this.#reject);
+      }
     } catch (error) {
-      // A synchronous throw from the recipe becomes the rejection, same as an async one.
+      // A synchronous throw from the work becomes the rejection, same as an async one.
       this.#reject(error);
     }
   }
@@ -216,7 +301,8 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * with a declared `Failure('Shutdown')` so every consumer resolves.
    *
    * ```ts
-   * const task = Task((signal) => fetch('https://example.com', { signal })).perform();
+   * const task = Task((_resolve, _reject, signal) => fetch('https://example.com', { signal }));
+   * task.perform();
    * const outcome = await task.shutdown(50); // Result | null — whatever had already landed
    * outcome === null || 'ok' in Object(outcome); // true
    * ```
@@ -240,25 +326,6 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   // ── Builders ─────────────────────────────────────────────────────────────────
 
   /**
-   * Lifts a promise or a recipe into a Task. A recipe stays lazy; a passed promise is already
-   * running (JS starts promises at creation) — the Task then only defers *observation*.
-   *
-   * ```ts
-   * // Defined, not invoked: the second line starts a real network request at call time —
-   * // that eagerness is exactly what the comment is documenting.
-   * function bothSpellings(url: string) {
-   *   Task.from(() => fetch(url)); // fully lazy — fetch fires on first await
-   *   return Task.from(fetch(url)); // fetch already in flight; retry/result still work
-   * }
-   * ```
-   */
-  static from<T, E = AnyFailure>(
-    source: PromiseLike<T> | (() => T | PromiseLike<T>),
-  ): TaskClass<T, E> {
-    return new TaskClass(source);
-  }
-
-  /**
    * The call boundary with arguments — `Promise.try`'s shape, made lazy: `fn(...args)` runs on
    * first await, and whatever it throws (sync or async) becomes the rejection. The closure the
    * caller would otherwise write by hand (`Task(() => fn(a, b))`) is built here instead.
@@ -279,9 +346,13 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
 
   /**
    * A resolved Task. Overridden because the inherited `Promise.resolve` builds via
-   * `new this(executor)`, which our recipe constructor would misread. Same for every other
-   * inherited static (`try` above, `reject`/`withResolvers`/the combinators below) that the
-   * base class would otherwise construct through `NewPromiseCapability`.
+   * `new this(executor)`, which our lazy constructor cannot satisfy — it stores the work
+   * rather than running it, so `NewPromiseCapability` never captures its resolvers. Same for
+   * every other inherited static (`try` above, `reject`/`withResolvers`/the combinators below).
+   *
+   * A Task passes straight through, as `Promise.resolve` passes a same-constructor promise
+   * through: wrapping one would hand back something whose `restart` re-awaits a settled inner
+   * Task instead of re-running its work, which is the lineage a Task exists to keep.
    *
    * ```ts
    * await Task.resolve(42); // 42 — a settled value lifted into Task-land
@@ -290,6 +361,7 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   static override resolve(): TaskClass<void>;
   static override resolve<T>(value: T | PromiseLike<T>): TaskClass<Awaited<T>>;
   static override resolve<T>(value?: T | PromiseLike<T>): TaskClass<Awaited<T>> {
+    if (value instanceof TaskClass) return value as TaskClass<Awaited<T>>;
     return new TaskClass(() => value as Awaited<T>);
   }
 
@@ -333,10 +405,8 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * (await a.await()) + (await b.await()); // 5
    * ```
    */
-  static async<T, E = AnyFailure>(
-    recipe: (signal: AbortSignal) => T | PromiseLike<T>,
-  ): TaskClass<T, E> {
-    return new TaskClass<T, E>(recipe).perform();
+  static async<T, E = AnyFailure>(source: Recipe<T> | Executor<T>): TaskClass<T, E> {
+    return new TaskClass<T, E>(source).perform();
   }
 
   /**
@@ -411,6 +481,11 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   // All four are overridden for correctness (the base implementations construct through
   // `new this(executor)`, which a recipe constructor cannot honour) and made LAZY: nothing in
   // `values` is observed — and no lazy member Task starts — until the combined Task is awaited.
+  //
+  // They also carry lineage the only way a combinator can. A derived Task walks back to one
+  // source; a combinator has many, so `restart` rebuilds it over freshly restarted members and
+  // `retry` therefore retries the work rather than re-reading settled answers. Members that are
+  // plain promises are passed through — already running, with no second execution to give.
 
   /**
    * Lazy `Promise.all`: on await, everything starts together, resolves positionally, and
@@ -427,7 +502,9 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   static override all<T>(values: Iterable<T | PromiseLike<T>>): TaskClass<Awaited<T>[]>;
   static override all(values: Iterable<unknown>): TaskClass<unknown[]> {
     const members = snapshotOnce(values);
-    return new TaskClass(() => Promise.all(members()));
+    const task = new TaskClass(() => Promise.all(members()));
+    task.#remake = () => TaskClass.all(members().map(restarted));
+    return task;
   }
 
   /**
@@ -442,7 +519,9 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   static override race<T>(values: Iterable<T | PromiseLike<T>>): TaskClass<Awaited<T>>;
   static override race(values: Iterable<unknown>): TaskClass<unknown> {
     const members = snapshotOnce(values);
-    return new TaskClass(() => Promise.race(members()));
+    const task = new TaskClass(() => Promise.race(members()));
+    task.#remake = () => TaskClass.race(members().map(restarted));
+    return task;
   }
 
   /**
@@ -456,7 +535,9 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   static override any<T>(values: Iterable<T | PromiseLike<T>>): TaskClass<Awaited<T>>;
   static override any(values: Iterable<unknown>): TaskClass<unknown> {
     const members = snapshotOnce(values);
-    return new TaskClass(() => Promise.any(members()));
+    const task = new TaskClass(() => Promise.any(members()));
+    task.#remake = () => TaskClass.any(members().map(restarted));
+    return task;
   }
 
   /**
@@ -478,7 +559,9 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
     values: Iterable<unknown>,
   ): TaskClass<PromiseSettledResult<unknown>[]> {
     const members = snapshotOnce(values);
-    return new TaskClass(() => Promise.allSettled(members()));
+    const task = new TaskClass(() => Promise.allSettled(members()));
+    task.#remake = () => TaskClass.allSettled(members().map(restarted));
+    return task;
   }
 
   /**
@@ -502,12 +585,14 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
     tasks: Iterable<TaskClass<T, E> | PromiseLike<T>>,
   ): TaskClass<Result<T, E>[], never> {
     const members = snapshotOnce(tasks);
-    return new TaskClass(
+    const combined = new TaskClass<Result<T, E>[], never>(
       () =>
-        Promise.all(members().map((task) => TaskClass.from<T, E>(task).result())) as Promise<
+        Promise.all(members().map((task) => new TaskClass<T, E>(task).result())) as Promise<
           Result<T, E>[]
         >,
     );
+    combined.#remake = () => TaskClass.results(members().map(restarted));
+    return combined;
   }
 
   // ── Data-first twins of every transforming method ────────────────────────────
@@ -582,14 +667,14 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   }
 
   /**
-   * Data-first twin of {@link TaskClass#expect} — context for declared failures only.
+   * Data-first twin of {@link TaskClass#context} — context for declared failures only.
    *
    * ```ts
-   * await Task.expect(Task(() => 'v'), 'must load'); // 'v' — context only decorates failures
+   * await Task.context(Task(() => 'v'), 'must load'); // 'v' — context only decorates failures
    * ```
    */
-  static expect<T, E>(task: TaskClass<T, E>, message: string): TaskClass<T, E> {
-    return task.expect(message);
+  static context<T, E>(task: TaskClass<T, E>, message: string): TaskClass<T, E> {
+    return task.context(message);
   }
 
   /**
@@ -665,19 +750,25 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   /**
    * Data-first twin of {@link TaskClass#result} — the bridge to the bare `Result` union.
    *
+   * Takes a foreign promise as well as a Task, matching {@link TaskClass.results} and the
+   * constructor: this twin is most useful over a value someone handed you, and being handed a
+   * promise is the ordinary case. A promise is lifted first, so its rejection lands on the
+   * failure channel exactly as a Task's would.
+   *
    * ```ts
    * const value = await Task.result(Task(() => 21 * 2)); // 42 — or the declared Failure, bare
+   * await Task.result(Promise.resolve(7)); // 7 — a foreign promise needs no wrapping first
    * ```
    */
-  static result<T, E>(task: TaskClass<T, E>): TaskClass<Result<T, E>, never> {
-    return task.result();
+  static result<T, E>(task: TaskClass<T, E> | PromiseLike<T>): TaskClass<Result<T, E>, never> {
+    return (task instanceof TaskClass ? task : new TaskClass<T, E>(task)).result();
   }
 
   // ── Transforming — lazy, and each returns a real Task ────────────────────────
   //
   // Every method derives a fresh `Task(() => this.then(...))`: the `this.then` inside the recipe
   // triggers the upstream Task — but only when the *derived* Task is awaited, so a chain like
-  // `task.map(f).expect(m)` stays fully lazy, and repeated awaits share the upstream's memoised
+  // `task.map(f).context(m)` stays fully lazy, and repeated awaits share the upstream's memoised
   // run. `#derive` also records the lineage that lets restart/retry re-execute the whole chain.
 
   #derive<U, F>(
@@ -751,8 +842,41 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * Task(() => execFileAsync('git', ['status'])) // foreign throw-land
    *   .mapErr((cause) => GitScanFailed({ ref }, { cause })); // classified HERE, once
    * ```
+   *
+   * A {@link define}d factory may be passed directly, with its payload as the second argument
+   * — the original is chained under `cause` for you. Factories carry their own `code` and `is`,
+   * so they are told from a mapper exactly rather than by arity:
+   *
+   * ```ts
+   * import { define } from '../result/failure.ts';
+   * const Unreadable = define('Unreadable', (d: { path: string }) => `cannot read ${d.path}`);
+   * const Denied = define('Denied', 'permission denied');
+   *
+   * Task(() => Promise.reject(new Error('EACCES')))
+   *   .mapErr(Unreadable, { path: '/etc/app.json' }); // payload given, cause chained
+   * Task(() => Promise.reject(new Error('EACCES'))).mapErr(Denied); // no payload to give
+   * ```
+   *
+   * Reach for the function form whenever the payload is read *from* the cause — the git scan
+   * above takes its `reason` from the error's first line, which no shorthand can express.
    */
-  mapErr<F>(fn: (error: unknown) => F): TaskClass<T, F> {
+  mapErr<Code extends string, Data>(
+    factory: FailureFactory<Code, Data>,
+    data: Data,
+  ): TaskClass<T, FailureOf<Code, Data>>;
+  mapErr<Code extends string>(
+    factory: FailureFactory<Code, undefined>,
+  ): TaskClass<T, FailureOf<Code, undefined>>;
+  mapErr<F>(fn: (error: unknown) => F): TaskClass<T, F>;
+  mapErr(fnOrFactory: unknown, data?: unknown): TaskClass<T, unknown> {
+    // Normalised once, here: everything downstream — including the re-derivation restart uses
+    // — sees a plain mapper, so the factory shape exists only at the call site.
+    const fn = isFactory(fnOrFactory)
+      ? (cause: unknown) =>
+          (fnOrFactory as unknown as (d: unknown, o: { cause: unknown }) => unknown)(data, {
+            cause,
+          })
+      : (fnOrFactory as (error: unknown) => unknown);
     return this.#derive(
       () =>
         this.then(undefined, (error) => {
@@ -773,7 +897,10 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * const log = (value: unknown): void => console.debug(value);
    * const req = new Request('https://example.com/users/7');
    *
-   * const reply = await route(req).recover((bug) => (log(bug), internalError()));
+   * const reply = await route(req).recover((bug) => {
+   *   log(bug);
+   *   return internalError();
+   * });
    * ```
    */
   recover<U = T>(fn: (error: unknown) => U | PromiseLike<U>): TaskClass<T | U, never> {
@@ -790,9 +917,9 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   }
 
   /**
-   * Deliberate non-handling — the Task spelling of `promise.catch(Failure.ignore(context))`.
+   * Deliberate non-handling — the Task spelling of `promise.catch(Failure.ignore(reason))`.
    * Swallows **every** rejection (bugs included: this is for cleanup whose failure genuinely
-   * has no consequence) and says so on stderr under `ELIXIR_SYSTEM_DEBUG` instead of vanishing.
+   * has no consequence) and says so on stderr under `QUNITX_DEBUG` instead of vanishing.
    *
    * Unlike every other method this one **starts the task**: "the outcome does not matter" is
    * not a decision laziness can defer, and eager attachment is what keeps a fire-and-forget
@@ -801,19 +928,19 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * ```ts
    * import { unlink } from 'node:fs/promises';
    *
-   * Task(unlink('/tmp/app-daemon.sock')).ignore('daemon socket unlink'); // fire and forget
-   * await Task(unlink('/tmp/app.lock')).ignore('daemon lock unlink'); // or join the cleanup
+   * Task(unlink('/tmp/qunitx-daemon.sock')).ignore('daemon socket unlink'); // fire and forget
+   * await Task(unlink('/tmp/qunitx.lock')).ignore('daemon lock unlink'); // or join the cleanup
    * ```
    */
-  ignore(context: string): TaskClass<T | undefined, never> {
-    const report = failureIgnore(context);
+  ignore(reason: string): TaskClass<T | undefined, never> {
+    const report = failureIgnore(reason);
     return this.#derive<T | undefined, never>(
       () =>
         this.then<T | undefined, undefined>(undefined, (error: unknown) => {
           report(error);
           return undefined;
         }),
-      (fresh) => fresh.ignore(context),
+      (fresh) => fresh.ignore(reason),
     ).perform();
   }
 
@@ -826,18 +953,21 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * ```ts
    * import { unlink } from 'node:fs/promises';
    *
-   * Task.ignore(unlink('/tmp/app-daemon.sock'), 'daemon socket unlink');
+   * Task.ignore(unlink('/tmp/qunitx-daemon.sock'), 'daemon socket unlink');
    * ```
    */
   static ignore<T>(
     source: PromiseLike<T> | (() => T | PromiseLike<T>),
-    context: string,
+    reason: string,
   ): TaskClass<T | undefined, never> {
-    return new TaskClass<T, AnyFailure>(source).ignore(context);
+    return new TaskClass<T, AnyFailure>(source).ignore(reason);
   }
 
   /**
-   * Adds context to a declared failure — anyhow's `.context()`, not Rust's panicking `expect`.
+   * Adds context to a declared failure — anyhow's `.context()`. Named for what it does, and
+   * deliberately NOT `expect`: `Result.expect` is Rust's, which PROMOTES a failure to a bug,
+   * and one word meaning both "keep this handled" and "crash on this" is the confusion worth
+   * spending a rename to avoid.
    * A `Failure` rethrows as a new Failure with the **same `code` and `data`** (so `E`, and every
    * `switch` on `code`, still hold), `message` as the context line, and the original chained
    * under `cause`. A *bug* passes through untouched: promoting it into the declared tier would
@@ -846,26 +976,30 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * ```ts
    * const loadUser = (id: number) => Task(() => ({ name: 'u' + id }));
    *
-   * await loadUser(7).expect('route /users/7 needs its user');
+   * await loadUser(7).context('route /users/7 needs its user');
    * // and when loadUser rejects with Failure(NotFound), the await throws:
    * // Failure(NotFound): route /users/7 needs its user
    * //   caused by: Failure(NotFound): no user 7
    * ```
    */
-  expect(message: string): TaskClass<T, E> {
+  context(message: string): TaskClass<T, E> {
     return this.#derive<T, E>(
       () =>
         this.then(undefined, (error: unknown) => {
           if (!isFailure(error)) throw error;
           throw new Failure(error.code, message, error.data, { cause: error });
         }),
-      (fresh) => fresh.expect(message),
+      (fresh) => fresh.context(message),
     );
   }
 
   /**
    * Substitutes `fallback` for a **declared** failure. A bug still rejects — a fallback that
    * absorbed a `TypeError` would be the silent-bug-hider the two-tier rule exists to prevent.
+   *
+   * Takes a **value**, not a thunk: `unwrapOr(() => x)` falls back to the function itself.
+   * For a fallback computed from the failure, use `match({ ok: (v) => v, err: fn })` — same
+   * two-tier gate, and `err` runs only when there is one.
    *
    * ```ts
    * const loadConfig = () => Task(() => ({ port: 8080 }));
@@ -917,7 +1051,7 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
   /**
    * A brand-new execution: fresh recipe run for a root Task, and for a *derived* Task the
    * lineage is walked — the source restarts and every derivation step is re-applied. So
-   * `scan.map(parse).expect(ctx).restart()` re-runs the git call, the parse, and the context
+   * `scan.map(parse).context(ctx).restart()` re-runs the git call, the parse, and the context
    * wrap; nothing is served from the old chain's memo.
    *
    * ```ts
@@ -932,7 +1066,14 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
     if (this.#source !== undefined && this.#rederive !== undefined) {
       return this.#rederive(this.#source.restart());
     }
-    return new TaskClass<T, E>(this.#recipe);
+    if (this.#remake !== undefined) return this.#remake();
+    // The work is copied across rather than re-passed through the constructor: an executor
+    // normalised once must not be re-sniffed by arity. A fresh Task means fresh resolvers, so
+    // a resolver captured by the previous attempt can only ever settle the attempt it came
+    // from — a stale callback cannot cross-settle this one.
+    const fresh = new TaskClass<T, E>(EMPTY_RECIPE as unknown as Recipe<T>);
+    fresh.#work = this.#work;
+    return fresh;
   }
 
   /**
@@ -942,30 +1083,79 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * Failure-blind by design: transient bugs (a socket reset surfacing as a raw error before its
    * `mapErr`) are exactly what call sites retry, so every rejection counts as an attempt.
    *
+   * An attempt that fails is then **abandoned**: its `AbortSignal` fires so an executor that
+   * subscribed to something can unsubscribe, rather than leaving a listener behind per attempt.
+   * The attempt has already settled, so this changes no outcome and its reason never reaches
+   * the caller — the failure they see is their own. Recipes take no signal and are untouched.
+   *
+   * The second argument is the wait between attempts — a number, or a function of the attempt
+   * just finished for backoff — or the full `{ delayMs, timeoutMs }` bag. `timeoutMs` bounds
+   * each attempt individually: the deadline abandons it (its signal fires, so cancellation-aware
+   * work stops) and it counts as a failure like any other. A pending wait is abortable, so
+   * `shutdown()` during one settles immediately rather than outliving the Task.
+   *
    * ```ts
    * // Defined, not invoked: a real scan spawns git subprocesses when awaited.
-   * function resilientScan(scan: () => Promise<string[]>) {
-   *   return Task(scan).retry(); // survives index.lock contention
+   * const scanChanges = (root: string, ref: string) => Task(() => new Set([root, ref]));
+   * function resilientScan(root: string, ref: string) {
+   *   return scanChanges(root, ref).retry(); // survives index.lock contention
    * }
    *
    * let attempts = 0;
    * const flakyUpload = Task(() => (++attempts < 3 ? Promise.reject(new Error('flaky')) : 'ok'));
    * await flakyUpload.retry(4); // 'ok' — succeeded on the 3rd of up to 5 fresh executions
+   *
+   * attempts = 0;
+   * await flakyUpload.retry(4, 1); // the same, waiting 1ms between attempts
+   * attempts = 0;
+   * await flakyUpload.retry(4, (attempt) => attempt); // backoff: 1ms, then 2ms
+   * attempts = 0;
+   * await flakyUpload.retry(4, { delayMs: 1, timeoutMs: 5_000 }); // and a per-attempt deadline
    * ```
    */
-  retry(times = 1): TaskClass<T, E> {
-    return new TaskClass<T, E>(async () => {
+  retry(times = 1, options: RetryDelay | RetryOptions = {}): TaskClass<T, E> {
+    const { delayMs, timeoutMs } =
+      typeof options === 'number' || typeof options === 'function'
+        ? { delayMs: options, timeoutMs: undefined }
+        : options;
+    // An executor rather than a recipe, so the loop receives the retry Task's own AbortSignal:
+    // a `shutdown()` mid-wait has to clear the pending timer, or the delay outlives the Task.
+    return new TaskClass<T, E>(async (_resolve, _reject, signal) => {
       const attempts = Math.max(0, times) + 1;
       let lastReason: unknown;
-      for (let attempt = 0; attempt < attempts; attempt++) {
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        const run = this.restart();
         try {
-          return await this.restart();
+          // A per-attempt deadline is `await`'s, whose timer is already cleared on settle. It
+          // does not stop the work — nothing in JS can — so the attempt is abandoned below,
+          // which is what lets a cancellation-aware one actually stop.
+          return await (timeoutMs === undefined ? run : run.await(timeoutMs));
         } catch (error) {
           lastReason = error;
+          run.#abandon();
+        }
+        if (attempt < attempts) {
+          const wait = typeof delayMs === 'function' ? delayMs(attempt) : (delayMs ?? 0);
+          if (wait > 0) await sleep(wait, signal);
         }
       }
       throw lastReason;
     });
+  }
+
+  /**
+   * Fires the abort signal of an attempt nothing will await again, so an executor that
+   * subscribed to something can unsubscribe. The attempt has already settled, so this cannot
+   * change any outcome — it is a cleanup notification, not a cancellation.
+   *
+   * Walks the derivation lineage because a chain's work lives in its source: abandoning
+   * `root.map(f)` has to reach `root`, which is where the executor (and its subscription) is.
+   */
+  #abandon(): void {
+    this.#controller?.abort(
+      new Failure('Abandoned', 'retry moved on from this attempt', undefined),
+    );
+    if (this.#source !== undefined) this.#source.#abandon();
   }
 
   // ── The one bridge to the value world ────────────────────────────────────────
@@ -978,7 +1168,7 @@ class TaskClass<T, E = AnyFailure> extends Promise<T> {
    * returned.
    *
    * Classifying a failure also reports it to the observation seam (`Failure.observed` — the
-   * `actorboy.failure.observed` channel plus `Failure.onObserved`), as do `match`/`unwrapOr`/
+   * `qunitx.failure.observed` channel plus `Failure.onObserved`), as do `match`/`unwrapOr`/
    * `recover`: a tracing adapter subscribed there annotates the active span with
    * `Failure.attributes(error)`, with zero tracing code at any call site.
    *
@@ -1024,14 +1214,67 @@ function snapshotOnce<T>(values: Iterable<T>): () => T[] {
 }
 
 /**
+ * A member restarted, when it is something that CAN be: a Task carries its recipe, so it can
+ * run again. A plain promise is already running and has no second execution to offer, so it is
+ * passed through — a combinator over promises restarts the combination, not the work behind it.
+ */
+function restarted<Member>(member: Member): Member {
+  return member instanceof TaskClass ? (member.restart() as Member) : member;
+}
+
+/** Milliseconds to wait before the next attempt, or a function of the attempt just finished —
+ *  the shape `lib/job` converged on for Oban-style backoff, with a constant as its degenerate
+ *  case. `(n) => Math.min(100 * 2 ** n, 30_000)` is exponential; `() => 100` is fixed. */
+export type RetryDelay = number | ((attempt: number) => number);
+
+/** The full option bag for {@link Task#retry}; pass a {@link RetryDelay} directly when the
+ *  delay is all you need. */
+export interface RetryOptions {
+  /** Wait between attempts. Omitted or `0` retries immediately, as it always has. */
+  delayMs?: RetryDelay;
+  /** Deadline for each individual attempt. The attempt is abandoned when it fires — its signal
+   *  goes off so cancellation-aware work stops — and counts as a failure like any other. */
+  timeoutMs?: number;
+}
+
+/**
+ * A delay that a signal can cut short, with nothing left behind on either path: the timer is
+ * cleared when the wait is abandoned, and the listener removed when it completes. Deliberately
+ * NOT unref'd — an unref'd timer lets Deno's test sanitizer (and a bare Node script) drain the
+ * loop mid-wait; clearing on both exits is what keeps it honest instead.
+ */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/** Placeholder work for the internal construction path in `restart()`, immediately replaced. */
+const EMPTY_RECIPE = (() => undefined) as unknown as Recipe<never>;
+
+function isThenable<T>(value: unknown): value is PromiseLike<T> {
+  return (
+    (typeof value === 'object' || typeof value === 'function') &&
+    value !== null &&
+    typeof (value as PromiseLike<T>).then === 'function'
+  );
+}
+
+/**
  * The call-or-construct type of the exported {@link Task} value: the class's statics and
  * construct signature, intersected with a plain call signature.
  */
 type TaskConstructor = typeof TaskClass & {
-  /** Call form — `Task(recipeOrPromise)` without `new`; identical to the constructor. */
-  <T, E = AnyFailure>(
-    source: PromiseLike<T> | ((signal: AbortSignal) => T | PromiseLike<T>),
-  ): TaskClass<T, E>;
+  /** Call form — `Task(source)` without `new`; identical to the constructor. */
+  <T, E = AnyFailure>(source: PromiseLike<T> | Recipe<T> | Executor<T>): TaskClass<T, E>;
 };
 
 /**

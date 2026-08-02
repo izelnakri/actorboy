@@ -105,7 +105,7 @@ class TaskImpl<T, E extends Failure = Failure> implements PromiseLike<T> {
 
   /** anyhow-style context. Wraps DECLARED failures only — a bug passes through untouched,
    *  because promoting a bug into the declared tier would hide it from the boundary. */
-  expect(message: string): Task<T, Failure> {
+  context(message: string): Task<T, Failure> {
     return Task<T, Failure>(() =>
       this.perform().catch((cause) => {
         if (cause instanceof Failure) throw new Failure(message, cause.httpStatus, { cause });
@@ -200,7 +200,7 @@ function githubProfile(username: string): Task<Profile, Failure> {
       url: u.html_url,
       followers: u.followers,
     }))
-    .expect(`github profile: ${username}`);
+    .context(`github profile: ${username}`);
 }
 
 function gitlabProfile(username: string): Task<Profile, Failure> {
@@ -217,7 +217,7 @@ function gitlabProfile(username: string): Task<Profile, Failure> {
         followers: null,
       };
     })
-    .expect(`gitlab profile: ${username}`);
+    .context(`gitlab profile: ${username}`);
 }
 
 // ── endpoint: /fs/{path} — file-system exposure, rooted and traversal-safe ───
@@ -268,7 +268,7 @@ function taskFs(rawPath: string): Task<FsEntry, Failure> {
     if (!decoded.ok)
       throw new Failure(`malformed percent-encoding: ${rawPath}`, 400, { cause: decoded.error });
     return await readEntry(decoded.value);
-  }).expect(`fs entry: ${rawPath || '(root)'}`);
+  }).context(`fs entry: ${rawPath || '(root)'}`);
 }
 
 // ── THE handler pattern: every endpoint is one pipeline + one destructure ────

@@ -356,6 +356,25 @@ export function isFailure(value: unknown): value is Any {
 export { isFailure as is };
 
 /**
+ * True for a factory made by {@link define}. A factory carries the `code` it produces and its
+ * own `is` guard; a plain error-mapper carries neither, so an API can accept both in one
+ * position and tell them apart exactly, without guessing from arity.
+ *
+ * ```ts
+ * const NotFound = define('NotFound', 'missing');
+ * isFactory(NotFound); // true
+ * isFactory((error: unknown) => from(error)); // false — a mapper, not a factory
+ * ```
+ */
+export function isFactory(value: unknown): value is FailureFactory<string, never> {
+  return (
+    typeof value === 'function' &&
+    typeof (value as { code?: unknown }).code === 'string' &&
+    typeof (value as { is?: unknown }).is === 'function'
+  );
+}
+
+/**
  * Narrows a Failure to one of several codes — the multi-code sibling of `Factory.is`.
  *
  * ```ts
@@ -439,7 +458,7 @@ const NODE_PROCESS = (
 // yields `undefined` and publishing is skipped.
 /**
  * Name of the diagnostics_channel that {@link ignore} publishes to on Node and Deno —
- * subscribe with the platform API, no registry of our own involved. Messages are
+ * subscribe with the platform API, no qunitx registry involved. Messages are
  * `{ context: string, error: unknown }`. Browsers have no channel; use {@link onIgnored}.
  *
  * ```ts
@@ -454,20 +473,21 @@ const NODE_PROCESS = (
  * diagnostics_channel.unsubscribe(Failure.IGNORED_CHANNEL_NAME, collect);
  * ```
  */
-export const IGNORED_CHANNEL_NAME = 'actorboy.failure.ignored';
+export const IGNORED_CHANNEL_NAME = 'qunitx.failure.ignored';
 const DIAGNOSTICS = NODE_PROCESS?.getBuiltinModule?.('node:diagnostics_channel') as
   typeof import('node:diagnostics_channel') | undefined;
 const ignoredChannel = DIAGNOSTICS?.channel(IGNORED_CHANNEL_NAME);
 
-// Debug output defaults to ELIXIR_SYSTEM_DEBUG, read once at import. The ignore() call sites
-// are cleanup paths that run with no config in scope (temp-dir removal, socket teardown), so
-// threading a `debug` flag to them is not an option. Mutable, because an env var read at import
-// time cannot be flipped from userland — `setDebug()` below is the runtime seam a host
-// application wires its own --debug flag into.
-let DEBUG = Boolean(NODE_PROCESS?.env?.ELIXIR_SYSTEM_DEBUG);
+// Debug output defaults to QUNITX_DEBUG, read once at import; `Config.setup()` calls
+// `setDebug(true)` when the --debug flag is set, so both switches reveal the same output.
+// The ignore() call sites are in cleanup paths that run with no config in scope (temp-dir
+// removal, socket teardown), so threading `config.debug` to them is not an option. Mutable,
+// because an env var read at import time cannot be flipped from userland — `setDebug()` below
+// is the runtime seam a host application (or a standalone packaging of this module) needs.
+let DEBUG = Boolean(NODE_PROCESS?.env?.QUNITX_DEBUG);
 
 /**
- * Toggles ignored-failure reporting at runtime, overriding the `ELIXIR_SYSTEM_DEBUG` default.
+ * Toggles ignored-failure reporting at runtime, overriding the `QUNITX_DEBUG` default.
  *
  * ```ts
  * import * as Failure from './failure.ts';
@@ -513,8 +533,8 @@ export function onIgnored(observer: IgnoredObserver | null): void {
 
 /**
  * Builds a `.catch()` handler for a failure that genuinely has no consequence — but says so
- * under `ELIXIR_SYSTEM_DEBUG` instead of vanishing. This is the raw handler; the ergonomic
- * spelling at call sites is `Task(promise).ignore(context)`, which wraps exactly this function.
+ * under `QUNITX_DEBUG` instead of vanishing. This is the raw handler; the ergonomic spelling
+ * at call sites is `Task(promise).ignore(context)`, which wraps exactly this function.
  *
  * This is the counterpart to `Result`, not a lesser version of it. A `Result` is for a failure
  * the caller branches on; unlinking a temp directory that is already gone is not that, and
@@ -522,15 +542,15 @@ export function onIgnored(observer: IgnoredObserver | null): void {
  * section of `docs/error-handling.md`).
  *
  * What it does fix is that one `.catch(() => {})` is indistinguishable from any other.
- * A real `EACCES` on a directory an application is trying to clean up, and a benign `ENOENT`
- * because it was already cleaned up, produce identical silence — inside code whose entire job
- * is diagnosing why a directory will not delete.
+ * A real `EACCES` on a directory qunitx is trying to clean up, and a benign `ENOENT` because
+ * it was already cleaned up, currently produce identical silence — inside code whose entire
+ * job is diagnosing why a directory will not delete.
  *
  * ```ts
  * import * as Failure from './failure.ts';
  *
  * import { unlink } from 'node:fs/promises';
- * const socketPath = '/tmp/app-daemon.sock';
+ * const socketPath = '/tmp/qunitx-daemon.sock';
  *
  * await unlink(socketPath).catch(Failure.ignore('daemon socket unlink')); // even a denied unlink is fine
  * ```
@@ -542,7 +562,7 @@ export function ignore(context: string): (error: unknown) => void {
     if (ignoredChannel?.hasSubscribers) ignoredChannel.publish({ context, error });
     if (!DEBUG) return;
     // stderr, not stdout: stdout is the TAP stream and a stray line there corrupts the report.
-    const line = `# [actorboy] ignored (${context}): ${format(error)}`;
+    const line = `# [qunitx] ignored (${context}): ${format(error)}`;
     if (NODE_PROCESS?.stderr) NODE_PROCESS.stderr.write(`${line}\n`);
     else console.error(line);
   };
@@ -577,7 +597,7 @@ export function ignore(context: string): (error: unknown) => void {
  * }
  * ```
  */
-export const OBSERVED_CHANNEL_NAME = 'actorboy.failure.observed';
+export const OBSERVED_CHANNEL_NAME = 'qunitx.failure.observed';
 const observedChannel = DIAGNOSTICS?.channel(OBSERVED_CHANNEL_NAME);
 
 /**

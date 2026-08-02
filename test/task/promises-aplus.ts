@@ -2,7 +2,7 @@
  * Runs the official Promises/A+ compliance suite (~870 tests) against Task.
  *
  * A standalone runner rather than a *-test.ts file: the suite drives its own mocha instance,
- * which cannot nest inside the `node --test` runner. Invoke with `npm run test:aplus`.
+ * which cannot nest inside the qunitx runner. Invoke with `npm run test:aplus`.
  *
  * The adapter is three one-liners because Task already IS a Promise — `withResolvers` is
  * exactly the `deferred()` shape the suite wants. What the suite actually proves is that the

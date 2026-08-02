@@ -6,12 +6,6 @@ This document argues for a specific design, shows the code, compares it honestly
 alternatives, catalogues the corner cases, and ends with a tutorial. It also says where the
 design is _not_ worth adopting, because that turns out to be a large fraction of any codebase.
 
-The design was extracted from [qunitx-cli](https://github.com/izelnakri/qunitx-cli), a
-browser test runner, and the concrete `lib/…`/`test/…` line references in §1 and §12 point at
-_that_ codebase — they are the measurements the design was argued from, kept because a design
-argument without a real codebase behind it is a preference. Everything in §2–§11 is about
-this package.
-
 ---
 
 ## 1. The problem, measured
@@ -190,8 +184,7 @@ problems per subclass:
    revived object.
 4. **Identity crosses realms.** The `Symbol.for` brand compares equal across workers, iframes
    and `vm` contexts, where each realm's own `Error.prototype` makes `instanceof` answer false.
-   The extraction codebase's main data path is two realms by construction: browser page →
-   WebSocket → CLI. `lib/node/` makes that the normal case rather than the exception.
+   qunitx's main data path is two realms by construction: browser page → WebSocket → CLI.
 5. **The stack is engineered, not inherited.** The capture anchor puts the _reporting_ site on
    top instead of factory plumbing; `stackless` skips capture in hot loops; the
    `stackTraceLimit` trick makes an anchored Failure cost about one plain `new Error()` instead
@@ -199,12 +192,11 @@ problems per subclass:
    wire failures too, where `util.inspect` gives up.
 
 The honest boundary: in a single-realm program that never serialises an error, points 3–4 lie
-dormant and this is a convention a team could hand-roll. The moment a program crosses a realm
-or a wire — a worker, an iframe, a WebSocket, a distributed node — they are what keeps an
-error an error on the far side.
+dormant and this is a convention a team could hand-roll. This codebase crosses realm and wire
+on its main path, which is why the module carries its weight here.
 
 `Failure.ignore(context)` is the deliberate opposite — labelled non-handling for a failure
-that genuinely has no consequence, which says so under `ELIXIR_SYSTEM_DEBUG` instead of vanishing.
+that genuinely has no consequence, which says so under `QUNITX_DEBUG` instead of vanishing.
 Its call-site spelling is `Task#ignore` (§10.2), which wraps the same handler and is **eager**
 — fire-and-forget cleanup attaches its observer immediately, so no unhandled-rejection window:
 
@@ -214,7 +206,7 @@ await Task(unlink(socketPath)).ignore('daemon socket unlink'); // or fire-and-fo
 
 It is not a lesser `Result`; it is what §11 recommends _instead_ of one. The point is that
 `.catch(() => {})` cannot be told apart from `.catch(() => {})` — a real `EACCES` on a
-directory the program is trying to clean up and a benign `ENOENT` because it was already gone
+directory qunitx is trying to clean up and a benign `ENOENT` because it was already gone
 produce identical silence, inside code whose whole job is diagnosing why a directory will not
 delete.
 
@@ -345,9 +337,8 @@ const report = withRetry(() => fetchStoredFailureReport(), 3);
 // and the fetched report comes back on the error channel. No error anywhere.
 ```
 
-A producer that fetches stored failure reports _as data_ — the extraction codebase's own
-domain: the browser ships test failures over a WebSocket and the CLI revives them with
-`Failure.fromJSON`, exactly what `lib/node/` does for every frame it carries — is
+A producer that fetches stored failure reports _as data_ — qunitx's own domain: the browser
+ships test failures over the WebSocket and the CLI revives them with `Failure.fromJSON` — is
 entirely legitimate, and under a generic retry it breaks twice with no error in sight: the
 middleware re-runs a non-idempotent call N times because every success tests as a failure,
 then routes the data it fetched onto the error channel. With the box, the same middleware was
@@ -517,11 +508,10 @@ propagate themselves.
 `Error.prototype`. An error constructed in one and tested in another fails `instanceof` while
 being, in every sense that matters, the same error.
 
-This is not exotic. A test runner that runs tests **inside a browser page** and ships failures
-to Node over a WebSocket — the program this was extracted from — crosses that link on its main
-path. Every error that crosses it is cross-realm by construction, and is additionally
-JSON-serialized, which destroys the prototype anyway. `lib/node/` turns that crossing into the
-default posture rather than a special case.
+This is not exotic for this project specifically: qunitx runs tests **inside a browser page**
+and ships failures to Node over a WebSocket. Every error that crosses that link is
+cross-realm by construction, and is additionally JSON-serialized, which destroys the prototype
+anyway.
 
 So the discriminant is a string:
 
@@ -566,7 +556,7 @@ return normalize(parsed.value);
 
 Flat, debuggable, breakpoint-able, and every failure is visibly handled. Where a pipeline is
 _not_ settled yet — async work — the value is not there to `if` on, and that is exactly where
-chaining earns its keep: `map`/`mapErr`/`expect` live as methods on `Task` (§10), the
+chaining earns its keep: `map`/`mapErr`/`context` live as methods on `Task` (§10), the
 _producer_, which may be a class because it never crosses a wire. On the settled side, `all`
 and `partition` are the two helpers that matter, both for batches.
 
@@ -1081,7 +1071,7 @@ The caller sees three codes, not three libraries' worth of error types.
 ### Step 5 — handle exhaustively at the top
 
 ```ts
-const config = await load('./app.json');
+const config = await load('./qunitx.json');
 if (Failure.is(config)) {
   switch (config.code) {
     case 'ConfigNotFound':
@@ -1150,14 +1140,31 @@ return. This section is the _producer_ half, for async code.
 ### 10.1 `Task<T, E>` — a lazy, retryable `Promise`
 
 A `Task` **is a real `Promise`** — `instanceof Promise` holds, and the official Promises/A+
-suite passes 872/872 (`npm run test:aplus`). It is built from a _recipe_ — a thunk that runs
-only when the Task is first awaited — and a failure is a real **rejection** whose reason is a
-`Failure`. Construction is call-or-construct, like `Date`:
+suite passes 872/872 (`npm run test:aplus`). A failure is a real **rejection** whose reason is
+a `Failure`. Construction is call-or-construct (like `Date`) and takes work in whichever shape
+it already has — the constructor dispatches on the function's declared arity:
+
+```ts
+Task(() => rpcFetchPosts()); // recipe    — zero params: the return value settles it
+Task((resolve, reject, signal) => {
+  // executor  — ≥1 param: settle by hand
+  const socket = open(url, { signal });
+  socket.on('data', resolve).on('error', reject);
+});
+Task(alreadyRunningPromise); // adopt    — a thenable, wrapped as-is
+```
+
+All three are lazy: nothing starts until the Task is first awaited (or `.then`-ed, or
+`.perform()`-ed). The executor form receives an `AbortSignal` that fires whenever this
+execution is abandoned — a timed-out `retry` attempt, or a losing `Task.race` member — which
+is what makes cancellation reach the underlying `fetch`/socket rather than merely being
+ignored.
 
 ```ts
 const posts = () => Task(() => rpcFetchPosts()); // the RPC fires only on await
 const list = await posts(); // the value, or it throws
 const fresh = await posts().retry(3); // a fresh execution per attempt
+const patient = await posts().retry(5, { delay: (n) => 2 ** n * 100, timeoutMs: 2_000 });
 
 task.perform(); // start NOW without suspending — a later `await task` joins the in-flight run
 ```
@@ -1168,17 +1175,24 @@ task.perform(); // start NOW without suspending — a later `await task` joins t
 the biggest surprise this design can inflict, so the reflection lives behind one method
 instead.
 
-Because every Task keeps its recipe **and its derivation lineage**, `.restart()` and
-`.retry(times = 1)` spawn fresh executions of the _whole chain_ —
-`scan.map(parse).expect(ctx).retry()` re-runs the git call, not just the parse — while
-ordinary derivation still shares the upstream's memoised run (one fetch, many `.map`s). `E` is
-the _declared_ failure type; it is advisory (JS rejections are untyped) but it makes
+Because every Task keeps its work **and its derivation lineage**, `.restart()` and
+`.retry(times, delayOrOptions?)` spawn fresh executions of the _whole chain_ —
+`scan.map(parse).context(ctx).retry()` re-runs the git call, not just the parse — while
+ordinary derivation still shares the upstream's memoised run (one fetch, many `.map`s). That
+lineage reaches through combinators too: `Task.all([a, b]).retry()` re-runs `a` and `b`, it
+does not re-read their settled answers. `E` is the _declared_ failure type; it is advisory (JS rejections are untyped) but it makes
 `.result()` return a typed `Result<T, E>`.
 
 The statics are the Promise statics, corrected and made lazy (`all`/`race`/`any`/`allSettled`
-observe nothing until the combined Task is awaited), plus `Task.try(fn, ...args)` — a lazy
-`Promise.try` — `Task.from`, `Task.fail(typedReason)`, `Task.withResolvers()`, and
+observe nothing until the combined Task is awaited, and each returns a `Task`, not a bare
+`Promise`), plus `Task.try(fn, ...args)` — a lazy `Promise.try` — `Task.withResolvers()`,
+`Task.result(work)`, the static mirror of `.result()` that also accepts a plain promise, and
 `Task.results(tasks)`, the positional batch that keeps every outcome as a typed `Result`.
+
+`Task.reject(reason)` and `Task.fail(reason)` are the same rejection with different types:
+`reject` is the inherited `Promise` static (`Task<never, never>` — an undeclared reason, i.e.
+a bug), while `fail` declares it (`Task<never, E>`), so `Task.fail(NotFound({ id }))` type-checks
+as an early return from a function whose signature promises `Task<User, NotFoundFailure>`.
 
 ### 10.2 `.result()` is the one bridge to the bare union
 
@@ -1193,20 +1207,22 @@ It reflects a declared `Failure` into the value world as itself — bare, typed 
 **re-throws a bug**, so the two-tier rule of §3 survives the crossing — and the same rule
 threads through every consuming method:
 
-| method                      | declared `Failure`                                    | bug (any other rejection)                                   |
-| --------------------------- | ----------------------------------------------------- | ----------------------------------------------------------- |
-| `result()`                  | the failure as a bare, typed value                    | re-thrown                                                   |
-| `match({ ok, err })`        | `err` branch, typed `E`                               | re-thrown                                                   |
-| `unwrapOr(fallback)`        | fallback                                              | re-thrown                                                   |
-| `expect(message)`           | re-thrown with context — same `code`/`data`, `cause`d | passes through untouched                                    |
-| `mapErr(fn)` — adapter      | remapped                                              | **remapped too** — classification happens here              |
-| `recover(fn)` — boundary    | recovered                                             | **recovered too** — the program's one `.catch()`            |
-| `ignore(context)` — cleanup | swallowed, labelled under `ELIXIR_SYSTEM_DEBUG`              | **swallowed too** — and EAGER: fire-and-forget attaches now |
+| method                     | declared `Failure`                                    | bug (any other rejection)                                   |
+| -------------------------- | ----------------------------------------------------- | ----------------------------------------------------------- |
+| `result()`                 | the failure as a bare, typed value                    | re-thrown                                                   |
+| `match({ ok, err })`       | `err` branch, typed `E`                               | re-thrown                                                   |
+| `unwrapOr(fallback)`       | fallback                                              | re-thrown                                                   |
+| `context(message)`         | re-thrown with context — same `code`/`data`, `cause`d | passes through untouched                                    |
+| `mapErr(fn \| Factory)`    | remapped                                              | **remapped too** — classification happens here              |
+| `recover(fn)` — boundary   | recovered                                             | **recovered too** — the program's one `.catch()`            |
+| `ignore(reason)` — cleanup | swallowed, labelled under `QUNITX_DEBUG`              | **swallowed too** — and EAGER: fire-and-forget attaches now |
 
-`expect` is anyhow's `.context()`, not Rust's panicking `expect`: the failure keeps its `code`
-and `data` (every `switch` on the code still works), gains the context message, and chains the
-original under `cause`. A bug is never promoted into the declared tier, where it would hide
-from the boundary.
+`context(message)` is anyhow's `.context()`, not Rust's panicking `expect` — hence the name:
+the failure keeps its `code` and `data` (every `switch` on the code still works), gains the
+context message, and chains the original under `cause`. A bug is never promoted into the
+declared tier, where it would hide from the boundary. (Rust's panicking `expect` does exist
+here, but on the value side as `Result.expect` — §9 — where promoting a failure to a bug is
+the explicit, permanent decision the name implies.)
 
 ### 10.3 The boundary story, completed
 
@@ -1216,17 +1232,35 @@ sees _every_ rejection, because its job is to turn foreign errors into declared 
 
 ```ts
 export function scanChanges(root: string, ref: string): Task<ChangeScan, GitScanFailure> {
-  return Task(() => runGit(root, ref)) // foreign throw-land: execFile, timeouts
+  return Task.all([runGit(diffArgs, root), runGit(statusArgs, root)]) // foreign throw-land
     .mapErr((cause) => GitScanFailed({ ref }, { cause })) // classified HERE, once
     .map(parse); // a bug in parse stays a bug
 }
 ```
 
-Everything downstream of the `mapErr` — `expect`, `result`, `match` — can then trust that a
+Everything downstream of the `mapErr` — `context`, `result`, `match` — can then trust that a
 rejection is either a declared `Failure` or a genuine bug. The live example is
 `lib/utils/get-changed-file-paths-in-git-since.ts`, consumed by `lib/setup/get-changed-fs-tree.ts`
 as `await getChanged(…).result()` — one `Failure.is` branch away from a typed
 `GitScanFailure`, no `instanceof` ladder.
+
+Because `runGit` returns a `Task` rather than a bare `Promise`, the two calls compose in one
+`Task.all`, the whole scan is retryable (a transient `index.lock` re-runs both), and there is
+no `await` anywhere in the producer — the classification line is the only place errors are
+touched.
+
+When the payload does not have to be read out of the error, the `(cause) => …` closure is
+noise, so `mapErr` takes a declared factory directly and chains the original under `cause` for
+you:
+
+```ts
+.mapErr(GitScanFailed, { ref })   // ≡ .mapErr((cause) => GitScanFailed({ ref }, { cause }))
+.mapErr(Unreadable)               // a factory that declares no data
+```
+
+The two overloads are distinguishable at both layers: a factory carries `code`/`is`, which a
+plain mapper does not, so the runtime discriminates them, and a data-carrying factory's first
+parameter is its data type — never `unknown` — so the type system does too.
 
 ### 10.4 When a `Task` is _not_ the answer
 
@@ -1236,11 +1270,18 @@ as `await getChanged(…).result()` — one `Failure.is` branch away from a type
 - it may need to run again (**retry**), or
 - it fails by **rejecting** and you want the failure type to survive the rejection.
 
-If a producer is awaited immediately, never retried, and already returns a typed `Result`,
-converting it to a `Task` is a **downgrade**: it adds a `.result()` call at every consumer and
-buys nothing. `Config.setup()` and the daemon's `runVia` are exactly that case, and they
-deliberately stay value-first — a plain `Promise<Result<…>>`. This is §11 applied to itself —
-the failure mode of a good abstraction is applying it everywhere.
+The last of the three is the one that is easy to under-count. A function that would otherwise
+be typed `Promise<Result<T, E>>` is _already_ task-shaped: it is async and it has a declared
+failure. Writing it as a `Task<T, E>` removes a whole channel — the caller awaits once and
+branches once (`await f().result()`) instead of awaiting a promise to get a union it then has
+to unwrap, and every intermediate step keeps composing (`.map`, `.mapErr`, `Task.all`) instead
+of being flattened by hand at each hop. The daemon's `runVia` was written the double-channel
+way and is now a `Task<number, RunViaFailure>` for exactly this reason.
+
+What does _not_ earn a `Task` is the case with no declared failure at all: `Config.setup()`
+either produces a config or has hit a bug, so it stays a plain `Promise` and lets the boundary
+catch. Converting _that_ adds a `.result()` at every consumer and buys nothing. This is §11
+applied to itself — the failure mode of a good abstraction is applying it everywhere.
 
 ## 11. When _not_ to use this
 
@@ -1262,16 +1303,10 @@ abstraction is applying it everywhere.
 
 ---
 
-## 12. Field notes — adopting it in a real codebase
+## 12. Verdict for this repository
 
-What follows is the adoption log from [qunitx-cli](https://github.com/izelnakri/qunitx-cli),
-the runner this system was extracted from: which sites were converted, which were deliberately
-left alone, and what the conversion found. Its `lib/…`/`test/…` paths are that repository's,
-not this package's — kept concrete because the useful part of an adoption note is the ratio it
-reports, and a ratio needs a real denominator.
-
-The verdict there: adopt for the ~15 sites where a failure is genuinely branched on, not for
-the 85 `catch` blocks. In descending order of value:
+Adopt for the ~15 sites where a failure is genuinely branched on, not for the 85 `catch`
+blocks. In descending order of value:
 
 1. **`test/helpers/shell.ts`'s `shellFails`** — already done in this branch as a worked
    example. It previously returned `CapturedResult | CapturedError | Error` with no
@@ -1314,23 +1349,23 @@ Deliberately **not** converted to Results: the 28 cleanup `.catch(() => {})` cal
 `unlink`/`rm`/`close`/`dispose`, where the failure genuinely has no consequence. Wrapping
 those would add ceremony and remove nothing. They now read
 `Task(promise).ignore('<what>')` — the open TODO item _"make all `.catch(() => {})` print
-something to debug"_ — so a suppressed failure is labelled, visible under `ELIXIR_SYSTEM_DEBUG`, and
+something to debug"_ — so a suppressed failure is labelled, visible under `QUNITX_DEBUG`, and
 eagerly observed (no unhandled-rejection window at fire-and-forget sites), while still
 costing nothing on the normal path.
 
 Ignored failures are observable through three seams, cheapest first: on Node and Deno each
-one publishes `{ context, error }` to the `actorboy.failure.ignored` **diagnostics_channel**
+one publishes `{ context, error }` to the `qunitx.failure.ignored` **diagnostics_channel**
 (`Failure.IGNORED_CHANNEL_NAME`) — the platform's own multi-subscriber mechanism, which APM
 agents and OpenTelemetry bridges already speak, costing one `hasSubscribers` boolean when
 nobody listens; `Failure.onIgnored(fn)` installs a single portable observer (it also works in
-browsers, which have no channel API); and `Failure.setDebug(true)` / `ELIXIR_SYSTEM_DEBUG` /
+browsers, which have no channel API); and `Failure.setDebug(true)` / `QUNITX_DEBUG` /
 `--debug` print each label as a TAP-safe stderr comment. The module reaches
 `diagnostics_channel` via `process.getBuiltinModule`, so no `node:` import ever lands in a
 browser bundle — there the chain resolves to `undefined` and publishing is skipped.
 
 _Handled_ failures have the mirror-image seam, for tracing: whenever a consuming method
 (`result()`, `match`, `unwrapOr`, `recover`) classifies a rejection as a declared Failure, it
-reports through `Failure.observed` — the `actorboy.failure.observed` channel plus the portable
+reports through `Failure.observed` — the `qunitx.failure.observed` channel plus the portable
 `Failure.onObserved(fn)` hook. A ~12-line tracing adapter subscribes once at boot, calls
 `span.recordException(error)` and `span.setAttributes(Failure.attributes(error))` on the
 active span (resolved via `AsyncLocalStorage`, which flows through Task's native promise
@@ -1349,7 +1384,7 @@ handling happens at a distance, when `runInBrowser` re-awaits the same promise i
 watch-mode build failure into silence. The labels are the only thing currently pointing at it.
 
 The `.catch((err) => config.debug && …)` family — the ~10 sites gated on `--debug` rather
-than `ELIXIR_SYSTEM_DEBUG` — is converted too, by answering the gate question head-on:
+than `QUNITX_DEBUG` — is converted too, by answering the gate question head-on:
 `Config.setup()` calls `Failure.setDebug(true)` when `--debug` is set, so both flags reveal
 `ignore()`-suppressed rejections and the two debug switches mean one thing. The wiring is
 enable-only: a daemon request without `--debug` never switches an env-enabled toggle off.

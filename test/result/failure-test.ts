@@ -266,7 +266,7 @@ module('Result | Failure | ignore observability', { concurrency: true }, () => {
       Failure.ignore('debug toggled off')(new Error('EPERM'));
     } finally {
       process.stderr.write = realWrite;
-      Failure.setDebug(Boolean(process.env.ELIXIR_SYSTEM_DEBUG));
+      Failure.setDebug(Boolean(process.env.QUNITX_DEBUG));
     }
     assert.true(
       written.some((line) => line.includes('ignored (debug toggled on): Error: EPERM')),
