@@ -89,6 +89,13 @@ export interface Raft<S> {
   snapshotIndex(): number;
   /** Leave the group: stop timers, reject in-flight proposals. */
   stop(): void;
+  /**
+   * Resolve once every persist started so far has settled. Most persists are fire-and-forget, so
+   * without this a caller cannot know when the last write reached disk — `stop()` returns while a
+   * rename is still in flight. Await it after `stop()` before tearing down the store's directory
+   * or exiting the process.
+   */
+  flush(): Promise<void>;
 }
 
 const NOT_LEADER = 'NotLeader';
@@ -181,18 +188,25 @@ export function raft<S>(
     peers = [...(snapConfig ?? options.peers)];
   };
 
-  const persist = (): Promise<void> =>
-    options.store
-      ? options.store.save(storeKey, {
-          currentTerm,
-          votedFor,
-          log,
-          snapIndex,
-          snapTerm,
-          snapState,
-          snapConfig,
-        })
-      : Promise.resolve();
+  // Most persists are started with `void persist()` — Raft must not block its timers on a disk
+  // write — so nothing awaits them by default. `inFlight` is what makes them reachable again:
+  // `flush()` waits on it, which is the difference between a graceful stop and a rename landing
+  // in a directory the caller has already torn down.
+  let inFlight: Promise<unknown> = Promise.resolve();
+  const persist = (): Promise<void> => {
+    if (!options.store) return Promise.resolve();
+    const write = options.store.save(storeKey, {
+      currentTerm,
+      votedFor,
+      log,
+      snapIndex,
+      snapTerm,
+      snapState,
+      snapConfig,
+    });
+    inFlight = Promise.allSettled([inFlight, write]);
+    return write;
+  };
 
   // A restarted member rejoins with its promises intact — Raft's safety depends on this
   // surviving a crash when a Store is provided.
@@ -584,6 +598,13 @@ export function raft<S>(
     state: () => state,
     committedIndex: () => commitIndex,
     snapshotIndex: () => snapIndex,
+    async flush() {
+      // Loop rather than await once: a persist can start while we are awaiting the previous one.
+      for (let seen = inFlight; ; seen = inFlight) {
+        await seen.catch(() => {});
+        if (inFlight === seen) return;
+      }
+    },
     stop() {
       alive = false;
       if (electionTimer) clearTimeout(electionTimer);
