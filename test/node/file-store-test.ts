@@ -102,6 +102,11 @@ module('Node | fileStore (disk durability, no DB)', () => {
       );
     } finally {
       store.stop();
+      // Raft persists fire-and-forget, so stop() can return with a rename still in flight. Without
+      // this the rm below wins the race on a slow runner and the write lands in a directory that
+      // no longer exists — an ENOENT after the test ended, which node reports as a file-level
+      // failure even though every assertion passed.
+      await store.raft.flush();
       node.stop();
       await rm(dir, { recursive: true, force: true });
     }
