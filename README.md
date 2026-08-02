@@ -254,6 +254,13 @@ crash rolls back through `recover()`. Compensations must be idempotent, and the 
 local and O(1). Eventually consistent **by design**: for a strongly consistent value, read the
 owning actor through `via:`, not the cache.
 
+Two `Store` backends ship in `actorboy/node`: `fileStore` (disk, with opt-in `fsync` durability and
+an orphan sweep) for a single host with no database, and `postgresStore` — driver-**injected**, so
+the library keeps its zero dependencies while the application brings `postgres`, `pg`, or anything
+with a `query(text, params)`. `workerPool` puts CPU-bound handlers on real worker threads, each a
+node in the cluster, which is what stops one expensive handler from freezing the event loop
+everything else runs on.
+
 `logger` takes `() => node.trace()` and every line then carries the ambient distributed-trace id,
 which is what correlates logs with the request tree and the telemetry span without a single
 call-site change.
@@ -264,6 +271,8 @@ call-site change.
   bare, why the discriminant is a string, the corner cases, the performance measurements, and
   an honest section on when _not_ to use any of this.
 - [docs/hot-code-upgrades.md](docs/hot-code-upgrades.md) — the Erlang↔JS mapping.
+- [docs/jobs-and-supervision.md](docs/jobs-and-supervision.md) — the durable queue, leadership by
+  lease, and how a supervision tree, a `Store` and a worker pool compose into a running system.
 - [examples/fault-tolerant-ledger](examples/fault-tolerant-ledger) — the fault-and-CPU
   boundary, architected: a supervised worker pool, worker-owned streaming, fail-fast
   readiness, and a demo that shows what one CPU-bound handler does to a single-threaded node.
