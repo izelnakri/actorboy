@@ -176,6 +176,35 @@ A served unit has a real mailbox (messages serialize per unit, `gen_server`-styl
 durability, `maxMailbox` load shedding, and an observer protocol for `:dbg`-style frame
 tracing.
 
+## PubSub, Presence, Telemetry
+
+Three services that fall out of a converging cluster, each its own entry point.
+
+```ts
+import * as PubSub from 'actorboy/pubsub';
+import * as Presence from 'actorboy/presence';
+import * as Telemetry from 'actorboy/telemetry';
+
+const bus = PubSub.pubsub(node); // Phoenix.PubSub, over the same process groups Phoenix uses pg for
+bus.subscribe('rooms:lobby', (event, payload) => render(event, payload));
+bus.broadcast('rooms:lobby', 'message', { text: 'hi' }); // reaches every subscriber, every node
+
+const tracker = Presence.presence(node); // Phoenix.Presence — the same ORSWOT, so it converges too
+tracker.track('rooms:lobby', 'user:1', { name: 'ada' });
+
+Telemetry.attach('metrics', ['node', 'call'], (event, measurements) => record(event, measurements));
+```
+
+`reliablePubSub` adds at-least-once delivery (per-sender sequence, gap-triggered replay, dedup,
+and a heartbeat so tail loss is detected) for topics where dropping a message is not acceptable.
+`shardedPresence` is the partitioned counterpart — one rendezvous-chosen coordinator per topic,
+so memory scales with the cluster rather than with every node holding everything.
+
+Load protection has three legs, all in `actorboy/node`: `circuitBreaker` (Erlang's `:fuse` — fail
+fast past a peer that is already failing), `rateLimiter` (token bucket, sustained rate plus
+burst), and the served unit's `maxMailbox`. `cluster()` is libcluster's polling formation:
+a strategy discovers peers, the manager diffs against the connected set and converges.
+
 ## Documentation
 
 - [docs/error-handling.md](docs/error-handling.md) — the full design argument: why the value is
