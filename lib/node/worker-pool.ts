@@ -208,7 +208,16 @@ export function workerPool(options: {
  * ```
  */
 export function dirtyDelegate(node: NodeHandle, pool: WorkerPool, subjects: string[]): void {
-  for (const subject of subjects) node.handle(subject, (payload) => pool.call(subject, payload));
+  for (const subject of subjects) {
+    node.handle(subject, (payload, _from, meta) =>
+      // The caller's REMAINING budget, forwarded. An ambient deadline CAPS a nested call but
+      // never raises it, so a hop that passes no timeout takes `call`'s 5s default however long
+      // the root caller allowed — and a 5s ceiling on delegated CPU work defeats the delegation.
+      // The pool answers on its own coordinator node, which cannot see this node's ambient
+      // context, so the budget has to be passed by hand rather than inherited.
+      pool.call(subject, payload, meta?.deadline && Math.max(0, meta.deadline - Date.now())),
+    );
+  }
 }
 
 /**
