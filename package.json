@@ -80,9 +80,9 @@
       "types": "./dist/lib/raft/index.d.ts",
       "default": "./dist/lib/raft/index.js"
     },
-    "./jobs": {
-      "types": "./dist/lib/jobs/index.d.ts",
-      "default": "./dist/lib/jobs/index.js"
+    "./job": {
+      "types": "./dist/lib/job/index.d.ts",
+      "default": "./dist/lib/job/index.js"
     },
     "./saga": {
       "types": "./dist/lib/saga/index.d.ts",

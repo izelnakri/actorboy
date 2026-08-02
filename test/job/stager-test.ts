@@ -1,6 +1,6 @@
 import { module, test } from 'qunitx';
-import { start, memoryHub, memoryStore } from '../../lib/node/index.ts';
-import { jobQueue, raftStore } from '../../lib/jobs/index.ts';
+import { Node, memoryHub, memoryStore } from '../../lib/node/index.ts';
+import { Job, raftStore } from '../../lib/job/index.ts';
 
 const until = async (cond: () => boolean, ms = 4000) => {
   const deadline = Date.now() + ms;
@@ -31,7 +31,7 @@ module('Jobs | stager (Oban rescuer — reclaim jobs orphaned mid-run)', () => {
     const store = memoryStore();
     const ran: string[] = [];
     await store.save('jobs:orphan', orphan('orphan', Date.now() - 10_000));
-    const jobs = jobQueue({
+    const queue = Job.queue({
       store,
       pollMs: 10,
       reclaimAfterMs: 50, // executing longer than 50ms → the owner is presumed dead
@@ -46,14 +46,14 @@ module('Jobs | stager (Oban rescuer — reclaim jobs orphaned mid-run)', () => {
       undefined,
       'the reclaimed job completed and was removed from the store',
     );
-    jobs.stop();
+    queue.stop();
   });
 
   test('an orphan already out of attempts is discarded, not re-run', async (assert) => {
     const store = memoryStore();
     const ran: string[] = [];
     await store.save('jobs:dead', orphan('dead', Date.now() - 10_000, true)); // attempt 3 / maxAttempts 3
-    const jobs = jobQueue({
+    const queue = Job.queue({
       store,
       pollMs: 10,
       reclaimAfterMs: 50,
@@ -64,14 +64,24 @@ module('Jobs | stager (Oban rescuer — reclaim jobs orphaned mid-run)', () => {
     assert.equal(
       ((await store.load('jobs:dead')) as { state: string }).state,
       'discarded',
-      'kept as discarded',
+      'kept as discarded — the durable dead-letter record in the STORE',
     );
-    jobs.stop();
+    // The rescue is a store-level fact. This queue never had `dead` in its own index (it was seeded
+    // straight into the store, as a dead node would leave it), so the app-facing `peekAll()` — which
+    // reads THIS instance's in-memory view — can't see it. `store.load` is the durable truth;
+    // `peekAll({ state: 'discarded' })` is per-instance. (An inserted-then-failed job IS in peekAll()
+    // — see the dead-letter routing test.)
+    assert.equal(
+      queue.peekAll({ state: 'discarded' }).length,
+      0,
+      'the app-level peekAll() reflects only this instance — a store-seeded reclaim is not in its view',
+    );
+    queue.stop();
   });
 
   test('reclaims through raftStore — the rescue is a committed Raft command', async (assert) => {
     const hub = memoryHub();
-    const node = start('n@st', hub.transport());
+    const node = Node.start('n@st', hub.transport());
     const store = raftStore(node, { peers: ['n@st'], electionTimeoutMs: () => 15 });
     const ran: string[] = [];
     try {
@@ -80,7 +90,7 @@ module('Jobs | stager (Oban rescuer — reclaim jobs orphaned mid-run)', () => {
         'the single-member group elected',
       );
       await store.save('jobs:orphan', orphan('orphan', Date.now() - 10_000));
-      const jobs = jobQueue({
+      const queue = Job.queue({
         store,
         pollMs: 15,
         reclaimAfterMs: 50,
@@ -90,7 +100,7 @@ module('Jobs | stager (Oban rescuer — reclaim jobs orphaned mid-run)', () => {
         await until(() => ran.includes('orphan')),
         'the raftStore stager reclaimed and re-ran it',
       );
-      jobs.stop();
+      queue.stop();
     } finally {
       store.stop();
       node.stop();

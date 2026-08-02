@@ -154,11 +154,11 @@ export * as Raft from './lib/raft/index.ts';
  * crash. Distributed by default: every node drains one shared store.
  *
  * ```ts
- * import { Jobs } from './mod.ts';
- * typeof Jobs.jobQueue; // 'function'
+ * import { Job } from './mod.ts';
+ * typeof Job.queue; // 'function'
  * ```
  */
-export * as Jobs from './lib/jobs/index.ts';
+export { Job } from './lib/job/index.ts';
 
 /**
  * Sage — multi-entity distributed transactions with compensation. Steps run forward threading a

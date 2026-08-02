@@ -6,13 +6,17 @@
 // coordinator; CLUSTER (`hub`) — the threads join a shared ws hub, so `group:<group>` is visible to
 // EVERY node in the cluster. A crashed worker is respawned (a supervised pool).
 import { Worker, parentPort, workerData } from 'node:worker_threads';
-import { start, fromPort } from './node.ts';
+import { Node, fromPort } from './node.ts';
 import { wsTransport } from './ws.ts';
 import { Task } from '../task/task.ts';
 import type { Frame, NodeHandle, Transport } from './node.ts';
 import { define, type Any as AnyFailure } from '../result/failure.ts';
 
 type BusSpec = { kind: 'port' } | { kind: 'ws'; url: string };
+
+// Every worker thread runs this bootstrap (not the user's module directly): it imports the user
+// module and calls serveWorker() with its exported `worker`, so the user module stays pure.
+const WORKER_BOOTSTRAP = new URL('./worker-bootstrap.ts', import.meta.url);
 
 // Restart intensity, Erlang's `max_restarts`/`max_seconds`: a slot that dies this often this
 // fast is not crashing on a transient, it is crashing on its own code, and re-arming it forever
@@ -53,12 +57,14 @@ export interface WorkerPool {
 }
 
 /**
- * Spawn `size` worker threads, each running the node behavior in `module` (a file that calls
- * {@link serveWorker}); `call`/`cast` round-robin across them. Work is addressed by subject, not by
- * shipping a closure (JS can't) — the same model as the cluster, one hop closer (a thread, not a
- * machine). A crashed worker is respawned (`respawn`, default true). Pass `hub` (a ws hub URL) to
- * run in CLUSTER mode: the threads join that hub, so `pool.group` is reachable from every node in
- * the cluster; omit it for a private, in-process LOCAL pool.
+ * Spawn `size` worker threads, each running the node behavior in `module` — a file that
+ * `export`s a pure `worker` setup, `export function worker(node) { node.handle(…) }` (the pool's
+ * bootstrap imports it and wires it up; the module itself has no top-level side effects). `call`/
+ * `cast` round-robin across them. Work is addressed by subject, not by shipping a closure (JS
+ * can't) — the same model as the cluster, one hop closer (a thread, not a machine). A crashed
+ * worker is respawned (`respawn`, default true). Pass `hub` (a ws hub URL) to run in CLUSTER mode:
+ * the threads join that hub, so `pool.group` is reachable from every node in the cluster; omit it
+ * for a private, in-process LOCAL pool.
  *
  * ```ts
  * typeof workerPool; // 'function' — usage needs a real worker module; see serveWorker
@@ -89,8 +95,16 @@ export function workerPool(options: {
 
   const spawn = (i: number, gen: number): void => {
     const name = `w${i}g${gen}-${id}@pool`;
-    const worker = new Worker(options.module, {
-      workerData: { __pool: { name, group, bus: busSpec, data: options.workerData } },
+    const worker = new Worker(WORKER_BOOTSTRAP, {
+      workerData: {
+        __pool: {
+          name,
+          group,
+          bus: busSpec,
+          data: options.workerData,
+          module: String(options.module), // the user module the bootstrap imports for its `worker`
+        },
+      },
     });
     if (busSpec.kind === 'port') worker.on('message', (frame: Frame) => deliver?.(frame));
     // Without this listener Node re-throws a worker's error on the HOST thread, so one bad user
@@ -131,7 +145,7 @@ export function workerPool(options: {
             deliver = handler;
           },
         };
-  const coord = start(`coord-${id}@pool`, transport);
+  const coord = Node.start(`coord-${id}@pool`, transport);
   const groupRef = `group:${group}`;
 
   return {
@@ -174,11 +188,13 @@ export function workerPool(options: {
 
 /**
  * The worker-side entry: read the pool's assignment (name + group + bus), start this thread's node,
- * and let `setup` register its handlers. Call it at the top of a {@link workerPool} `module` file.
+ * and let `setup` register its handlers. The pool's bootstrap calls this with your module's exported
+ * `worker` — so you normally write `export function worker(node) { … }` and never call this directly.
+ * (It stays exported for advanced/manual bootstrapping.)
  *
  * ```ts
- * // cpu-worker.ts, inside a worker thread:
- * // serveWorker((node) => node.handle('fib', (n) => fib(n as number)));
+ * // cpu-worker.ts — the whole worker module, pure:
+ * // export function worker(node) { node.handle('fib', (n) => fib(n as number)); }
  * typeof serveWorker; // 'function'
  * ```
  */
@@ -193,7 +209,7 @@ export function serveWorker(setup: (node: NodeHandle, data: unknown) => void): N
       ? wsTransport(assign.bus.url)
       : // node MessagePort has on()/postMessage(); cast past its DOM addEventListener overload.
         fromPort(parentPort as unknown as Parameters<typeof fromPort>[0]);
-  const node = start(assign.name, transport);
+  const node = Node.start(assign.name, transport);
   node.join(assign.group);
   setup(node, assign.data);
   return node;

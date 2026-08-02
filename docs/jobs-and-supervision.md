@@ -6,10 +6,9 @@ and **Horde**), in universal TypeScript. This guide is the map; the API docs liv
 ## Jobs
 
 ```ts
-import { jobQueue } from 'actorboy/jobs';
-import { memoryStore } from 'actorboy/node';
+import { Job, memoryStore } from 'actorboy/node';
 
-const jobs = jobQueue({
+const jobs = Job.queue({
   store: memoryStore(),
   workers: { 'email.welcome': (args, job, signal) => send(args, { signal }) },
 });
@@ -36,7 +35,7 @@ scheduled ─(its time)→ available
 `discarded` jobs are kept as the **dead-letter record** (with their `errors`); everything else is
 removed on completion so the queue stays bounded.
 
-**Inspect the queue** — `jobs.job(id)` (one), `jobs.list({ queue?, state?, worker? })` (a filtered,
+**Inspect the queue** — `jobs.peek(id)` (one), `jobs.peekAll({ queue?, state?, worker? })` (a filtered,
 copy-safe snapshot for admin/observability), `jobs.cancelJob(id)`, `jobs.pauseQueue`/`resumeQueue`,
 `jobs.drain()` (run everything runnable — the test helper).
 
@@ -44,9 +43,10 @@ copy-safe snapshot for admin/observability), `jobs.cancelJob(id)`, `jobs.pauseQu
 worker's `AbortSignal` (cooperative — a worker that checks `signal.aborted` stops; one that ignores
 it finishes) and ends it terminal, not retried.
 
-**Dead-letter routing** — each `errors[]` entry is `{ attempt, at, error, code?, meta? }`: `error`
-always has the stack; a thrown `Failure` also contributes `code` + safe-serialized `data`. Route on
-it: `jobs.list({ state: 'discarded' }).filter(j => j.errors.at(-1)?.code === 'RateLimited')`.
+**Dead-letter routing** — each `errors[]` entry is `{ attempt, at, error }`, where `error` is always
+a live `Failure` (even after a store reload): a thrown `Failure` keeps its `code` + `data`; a raw
+throw is coerced to code `'Unknown'` with the original in `.cause`. Route on it:
+`jobs.peekAll({ state: 'discarded' }).filter(j => j.errors.at(-1)?.error.code === 'RateLimited')`.
 
 ## Fault tolerance — three layers, and what triggers each
 
@@ -59,7 +59,7 @@ a supervisor.**
 | a **node dies** mid-job           | the **stager** reclaims it; a survivor re-runs (`SKIP LOCKED`, never twice) | `reclaimAfterMs` — on by default, 60 min (Oban's Lifeline) |
 | a **service** crashes _as a unit_ | a **`supervisor`** restarts it — _if it exposes `onExit`_                   | wrap it in a `supervisor`                                  |
 
-A bare `jobQueue(...)` already has layers 1–2 — a failing job is retried, a dead node's work is
+A bare `Job.queue(...)` already has layers 1–2 — a failing job is retried, a dead node's work is
 reclaimed — **with no supervisor involved.** The supervisor is an _optional_ top layer.
 
 ## Stores — pick your durability
@@ -78,7 +78,7 @@ no coordination. But **cron** would fire on every node, so pass a `leader`:
 
 ```ts
 const lead = leader({ store, key: 'jobs:cron', candidate: nodeName });
-const jobs = jobQueue({ store, leader: lead, cron: { '0 9 * * *': { worker: 'report.daily' } } });
+const jobs = Job.queue({ store, leader: lead, cron: { '0 9 * * *': { worker: 'report.daily' } } });
 ```
 
 On a `raftStore`, `leader()` uses **CP** leadership (terms + quorum — no split-brain); elsewhere a
@@ -102,7 +102,7 @@ const app = supervisor(
     { name: 'store', start: () => fileStore('./data') },
     {
       name: 'jobs',
-      start: (get) => jobQueue({ store: get('store'), workers }),
+      start: (get) => Job.queue({ store: get('store'), workers }),
       restart: 'permanent',
     },
     { name: 'web', start: (get) => serveHttp({ jobs: get('jobs') }) },
@@ -126,6 +126,47 @@ instead of crash-looping forever (OTP's `max_restarts`).
 liveness); wiring the child's `onExit` also restarts it _in place_ on a live node. Compose: a
 `distributedSupervisor` child is often a local `supervisor` subtree — distributed decides _which
 node_ hosts a key and survives node loss; local decides _what it's made of_ and restarts its parts.
+
+### A stateful gen_server per key, with failover
+
+A `genServer` lives on _one_ node — the same as Elixir, where a pid is bound to its node. To run one
+"anywhere in the cluster, and survive a node dropping," make it a `distributedSupervisor` child with
+**`superviseGenServer`** (which wraps the handle as a supervisable `Service` — `stop()` for graceful
+handoff, `onExit` for an abnormal death) and a **durable `store`**. Placement is by rendezvous (one
+host per key); on node loss the key re-homes to a survivor whose fresh unit rehydrates from the store:
+
+```ts
+const store = postgresStore(pool); // shared by every node — the state that outlives a host
+const ledgers = distributedSupervisor(node, shardedRegistry(node), {
+  name: 'ledgers',
+  desired: ['acct-1', 'acct-2', 'acct-3'],
+  start: (key) => superviseGenServer(node, key, ledgerBehavior, { store, storeKey: key }),
+});
+await ledgers.whereis('acct-1'); // which node hosts it right now
+(ledgers.local('acct-1') as GenServer).call('debit', 100); // if hosted here: the typed local client
+```
+
+This is Horde's `DynamicSupervisor` + a durable store — a singleton _per key_ with state-preserving
+failover, not N live replicas. Only one instance is ever active (no double-debits); "redundancy" is
+the cluster's ability to _re-home_, and the state's survival is the store, not a second live copy. If
+you truly need multiple copies accepting writes at once, that's consensus (`raftStore` — CP) or a
+CRDT (AP) — a deliberate step up in cost, for when one active owner isn't enough.
+
+**Let it crash** — a **bug** (a non-`Failure` throw) can either terminate the unit (OTP "let it
+crash": the supervisor restarts a fresh one that rehydrates from the store, and the in-flight caller
+gets a `UnitCrashed` failure with the bug as `.cause`) or be answered as a `RemoteCrash` reply while
+the unit keeps serving. Which one is the `crashOnError` option — and **its default tracks whether a
+restarter exists**: `superviseGenServer` defaults it **on** (you supervised it, so a bug should
+restart it — the whole point of the supervisor), while a bare `genServer` defaults it **off** (an
+unsupervised unit shouldn't self-destruct permanently on one bug — it degrades by replying the
+error). Override either way with `{ crashOnError: … }`. A thrown or returned declared `Failure` is
+always an expected reply, never a crash — only bugs crash, so domain errors stay cheap.
+
+For a single named process rather than a keyspace, `genServer(node, name, behavior, { via: { registry,
+key } })` registers it under a cluster-wide name (Elixir's `{:via, Registry, {Reg, key}}`); any node
+reaches it as `via:<registry>/<key>`, and if two nodes race the key the loser self-terminates
+(`UnitDown`) so callers re-resolve to the survivor. `via` names and locates; `distributedSupervisor`
+also _places and re-homes_.
 
 ## Building a supervisable service
 
@@ -156,8 +197,8 @@ function wsClient(url: string) {
 }
 ```
 
-Omit `onExit` only for a service that **self-heals** (a `jobQueue` retries its own jobs) or can't
-crash as a unit — then use `restart: 'temporary'`. `jobQueue` _does_ expose `onExit` for the rare
+Omit `onExit` only for a service that **self-heals** (a `Job.queue` retries its own jobs) or can't
+crash as a unit — then use `restart: 'temporary'`. `Job.queue` _does_ expose `onExit` for the rare
 catastrophic scheduler failure, so it can be supervised without the warning.
 
 **The one rule that keeps restart honest** (this is a real JS limit, not OTP's): a service's state

@@ -1,7 +1,7 @@
 import { Failure, isFailure, type Any as AnyFailure } from '../result/failure.ts';
 import { raft, type Raft } from '../raft/raft.ts';
 import type { NodeHandle } from '../node/node.ts';
-import type { Store } from '../node/upgradable.ts';
+import type { Store } from '../node/store.ts';
 
 /** The replicated state: a plain KV (JSON-safe, so Raft can snapshot it). */
 type KV = Record<string, unknown>;
@@ -90,7 +90,7 @@ function apply(command: unknown, state: KV): { state: KV; reply?: unknown } {
  * A {@link Store} whose state is a Raft-replicated KV — the in-house, external-DB-free distributed
  * store. Every save/clear/claim/lease is a committed Raft command, so `claim` and `lease` are
  * LINEARIZABLE across the cluster: Raft's atomicity replaces Postgres's `SKIP LOCKED` / advisory
- * lock, so every node runs the same {@link jobQueue} against it and the claim hands each job to
+ * lock, so every node runs the same {@link Job.queue} against it and the claim hands each job to
  * exactly one node — no leader election bolted on, no double execution. Durability is
  * majority-replicated (each member persists its Raft log via `persistence`, default in-memory).
  * Reads (`load`) are LOCAL (eventually consistent — the linearizable ops are the ones that matter).
@@ -98,9 +98,9 @@ function apply(command: unknown, state: KV): { state: KV; reply?: unknown } {
  * consensus round per mutation — fits moderate-throughput queues; a firehose still wants Postgres.
  *
  * ```ts
- * import { start, memoryHub } from '../node/index.ts';
+ * import { Node, memoryHub } from '../node/index.ts';
  *
- * const node = start('n@raft', memoryHub().transport());
+ * const node = Node.start('n@raft', memoryHub().transport());
  * const store = raftStore(node, { peers: ['n@raft'], electionTimeoutMs: () => 15 });
  * await new Promise((r) => setTimeout(r, 60)); // the single-member group elects itself
  * await store.save('greeting', 'hi');

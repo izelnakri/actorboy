@@ -1,4 +1,4 @@
-// A Postgres-backed {@link Store} — the durable, multi-node backend for jobQueue and leader(). It
+// A Postgres-backed {@link Store} — the durable, multi-node backend for Job.queue and leader(). It
 // imports NO sql package: the developer injects a driver (a ~3-line adapter over `postgres`,
 // node-`pg`, or pglite), so this project declares no database dependency and runs no DB in CI.
 //
@@ -12,11 +12,11 @@
 // can't elect two holders) — no advisory lock is needed, since the CP leadership path is
 // {@link leader} over a raftStore. The examples below exercise the driver-injection contract
 // against a fake executor, which is why neither they nor CI need a database.
-import type { Store } from './upgradable.ts';
+import type { Store } from './store.ts';
 
 /** The one method a driver must expose — run a parameterized query, return the rows. */
 export interface SqlExecutor {
-  /** Run `text` with `params` bound positionally ($1, $2, ...) and return the result rows. */
+  /** Run a parameterized query (`$1`, `$2`, …) and resolve to the rows. */
   query<Row = Record<string, unknown>>(text: string, params?: unknown[]): Promise<Row[]>;
 }
 
