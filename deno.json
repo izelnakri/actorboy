@@ -22,7 +22,7 @@
     "./logger": "./lib/logger/index.ts"
   },
   "publish": {
-    "include": ["lib/", "mod.ts", "deno.json", "README.md", "LICENSE", "docs/"],
+    "include": ["lib/", "mod.ts", "cli.ts", "deno.json", "README.md", "LICENSE", "docs/"],
     "exclude": ["docs/api/"]
   },
   "imports": {
