@@ -231,6 +231,33 @@ rendezvous-chosen coordinator, so memory scales with the cluster instead of ever
 every key — and because claims serialize through that coordinator, it restores Elixir's
 **synchronous** duplicate rejection, which the fully-replicated registry structurally cannot.
 
+## Jobs, Sagas, Cache, Logger
+
+```ts
+import { jobQueue, leader } from 'actorboy/jobs';
+import { saga } from 'actorboy/saga';
+```
+
+`jobQueue` is Oban: jobs persist through the `Store` seam **before** `insert` resolves, run under
+per-queue concurrency limits, retry with backoff to `maxAttempts` (then stay as `discarded`, with
+their errors), and are rescued after a crash. Distributed by default — every node drains the same
+store and the atomic `Store.claim` (`SKIP LOCKED`, in the Postgres case) partitions the work, so
+there is no election to get wrong. Cron entries fire **cluster-once** via `leader()`, Oban's Peer,
+which is a `Store.lease` rather than a consensus round.
+
+`saga` is Sage: multi-entity transactions above single-key atomicity. Steps run forward threading a
+context; on a failure the completed steps' compensations run **in reverse** — the distributed
+substitute for two-phase commit. With a `Store` the step log is durable, so a saga stranded by a
+crash rolls back through `recover()`. Compensations must be idempotent, and the docs say so.
+
+`distributedCache` is an `LWWMap` gossiped over PubSub — cluster-coherent, no central Redis, reads
+local and O(1). Eventually consistent **by design**: for a strongly consistent value, read the
+owning actor through `via:`, not the cache.
+
+`logger` takes `() => node.trace()` and every line then carries the ambient distributed-trace id,
+which is what correlates logs with the request tree and the telemetry span without a single
+call-site change.
+
 ## Documentation
 
 - [docs/error-handling.md](docs/error-handling.md) — the full design argument: why the value is

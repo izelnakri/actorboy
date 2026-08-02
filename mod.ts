@@ -147,3 +147,49 @@ export * as Telemetry from './lib/telemetry/index.ts';
  * ```
  */
 export * as Raft from './lib/raft/index.ts';
+
+/**
+ * Oban — the durable background-job queue. Jobs persist through the `Store` seam BEFORE insert
+ * resolves, run under per-queue concurrency limits, retry with backoff, and are rescued after a
+ * crash. Distributed by default: every node drains one shared store.
+ *
+ * ```ts
+ * import { Jobs } from './mod.ts';
+ * typeof Jobs.jobQueue; // 'function'
+ * ```
+ */
+export * as Jobs from './lib/jobs/index.ts';
+
+/**
+ * Sage — multi-entity distributed transactions with compensation. Steps run forward threading a
+ * context; on a failure, the completed steps' compensations run in reverse.
+ *
+ * ```ts
+ * import { Saga } from './mod.ts';
+ * typeof Saga.saga; // 'function'
+ * ```
+ */
+export * as Saga from './lib/saga/index.ts';
+
+/**
+ * A cluster-coherent cache with no central Redis — an LWWMap gossiped over PubSub, so a set or an
+ * invalidation on any node converges everywhere and reads stay local and O(1).
+ *
+ * ```ts
+ * import { Cache } from './mod.ts';
+ * typeof Cache.distributedCache; // 'function'
+ * ```
+ */
+export * as Cache from './lib/cache/index.ts';
+
+/**
+ * Elixir's `Logger` — leveled, structured, JSON. Hand it `() => node.trace()` and every line
+ * carries the ambient distributed-trace id, correlating logs with the request tree for free.
+ *
+ * ```ts
+ * import { Logger } from './mod.ts';
+ * const log = Logger.logger({ sink: () => {} });
+ * log.info('started', { port: 8080 });
+ * ```
+ */
+export * as Logger from './lib/logger/index.ts';

@@ -15,7 +15,11 @@
     "./pubsub": "./lib/pubsub/index.ts",
     "./presence": "./lib/presence/index.ts",
     "./telemetry": "./lib/telemetry/index.ts",
-    "./raft": "./lib/raft/index.ts"
+    "./raft": "./lib/raft/index.ts",
+    "./jobs": "./lib/jobs/index.ts",
+    "./saga": "./lib/saga/index.ts",
+    "./cache": "./lib/cache/index.ts",
+    "./logger": "./lib/logger/index.ts"
   },
   "publish": {
     "include": ["lib/", "mod.ts", "deno.json", "README.md", "LICENSE", "docs/"],
