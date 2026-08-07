@@ -40,7 +40,7 @@ const NotFound = Failure.define('NotFound', (d) => \`no user \${d.id}\`);
 const parsed = Result.try(JSON.parse, '{"n":1}');
 assert.ok(parsed.ok && parsed.value.n === 1);
 assert.equal(await Task(() => 21).map((n) => n * 2), 42);
-assert.deepEqual(await Stream.from([1, 2, 3]).map((n) => n * 2).values(), [2, 4, 6]);
+assert.deepEqual(await Stream.from([1, 2, 3]).map((n) => n * 2).collect(), [2, 4, 6]);
 
 const failed = await Task(() => { throw NotFound({ id: 7 }); }).result();
 assert.ok(Failure.is(failed) && failed.code === 'NotFound');
