@@ -25,7 +25,7 @@ const double = (n: number) => n * 2;
 const isEven = (n: number) => n % 2 === 0;
 
 Deno.bench('stream: map+filter over 1000, collected', { group: 'pipeline' }, async () => {
-  await Stream.from(THOUSAND).map(double).filter(isEven).values();
+  await Stream.from(THOUSAND).map(double).filter(isEven).collect();
 });
 
 Deno.bench('stream: the eager array equivalent', { group: 'pipeline' }, () => {
@@ -33,20 +33,20 @@ Deno.bench('stream: the eager array equivalent', { group: 'pipeline' }, () => {
 });
 
 Deno.bench('stream: four-stage pipeline over 1000', { group: 'pipeline' }, async () => {
-  await Stream.from(THOUSAND).map(double).filter(isEven).map(double).take(100).values();
+  await Stream.from(THOUSAND).map(double).filter(isEven).map(double).take(100).collect();
 });
 
 // Laziness is the reason `take` belongs above: the source is 1000 elements, the consumer
 // wants 10, and only 10 should ever be produced. If this ever approaches the full-pipeline
 // number, laziness has regressed into eager evaluation.
 Deno.bench('stream: take(10) of a 1000-element source', { group: 'lazy' }, async () => {
-  await Stream.from(THOUSAND).map(double).take(10).values();
+  await Stream.from(THOUSAND).map(double).take(10).collect();
 });
 
 Deno.bench('stream: unfold + take(10) (infinite source)', { group: 'lazy' }, async () => {
   await Stream.unfold(0, (n) => [n, n + 1] as const)
     .take(10)
-    .values();
+    .collect();
 });
 
 Deno.bench('stream: partition 1000 mixed outcomes', { group: 'failures' }, async () => {
@@ -54,11 +54,11 @@ Deno.bench('stream: partition 1000 mixed outcomes', { group: 'failures' }, async
 });
 
 Deno.bench('stream: chunkEvery(50) over 1000', { group: 'reshape' }, async () => {
-  await Stream.from(THOUSAND).chunkEvery(50).values();
+  await Stream.from(THOUSAND).chunkEvery(50).collect();
 });
 
 Deno.bench('stream: scan over 1000', { group: 'reshape' }, async () => {
   await Stream.from(THOUSAND)
     .scan((total, n) => total + n)
-    .values();
+    .collect();
 });

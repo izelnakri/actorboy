@@ -54,10 +54,18 @@ export { Task } from './lib/task/task.ts';
  *
  * ```ts
  * import { Stream } from './mod.ts';
- * await Stream.from([1, 2, 3]).map((n) => n * 2).values(); // [2, 4, 6]
+ * await Stream.from([1, 2, 3]).map((n) => n * 2).collect(); // [2, 4, 6]
  * ```
  */
-export { Stream, type Source } from './lib/stream/stream.ts';
+export {
+  Stream,
+  ChannelOverflow,
+  type Channel,
+  type ChannelOptions,
+  type ChannelOverflowFailure,
+  type Overflow,
+  type Source,
+} from './lib/stream/stream.ts';
 
 /**
  * OTP supervision for in-process JS — restart policies, strategies, and an intensity budget.
