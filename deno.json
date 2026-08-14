@@ -19,7 +19,11 @@
   },
   "imports": {
     "ws": "npm:ws@^8.21.0",
-    "qunitx": "npm:qunitx@^1.2.18"
+    "qunitx": "npm:qunitx@^1.2.18",
+    // examples/ only, and dev-only at that: `typecheck` runs `deno check --doc` over the
+    // examples as well as lib/, so the driver an example imports has to resolve. lib/ defines
+    // the Store seam; an application brings its own backend — nothing published depends on it.
+    "postgres": "npm:postgres@^3.4.9"
   },
   // Stated, not defaulted: deno reads the sibling tsconfig.json (which exists for the npm
   // `tsc` build and therefore declares node/DOM libs), and its `lib` would otherwise displace

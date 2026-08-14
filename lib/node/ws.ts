@@ -159,7 +159,10 @@ export const jsonCodec: Codec = {
 
 /**
  * A node's socket into the cluster — dial the hub (or any relay speaking the same codec)
- * and the `Node` core does the rest: two OS processes, two runtimes, one cluster.
+ * and the `Node` core does the rest: two OS processes, two runtimes, one cluster. Redials
+ * with exponential backoff by default (Erlang's automatic reconnect): held frames flush on
+ * reopen and the node re-runs its hello handshake via `onReopen`. Pass `reconnect: false`
+ * for one-shot sockets.
  *
  * ```ts
  * import { start } from './node.ts';
@@ -170,26 +173,99 @@ export const jsonCodec: Codec = {
  * }
  * ```
  */
-export function wsTransport(url: string, options: { codec?: Codec } = {}): Transport {
+export function wsTransport(
+  url: string,
+  options: {
+    codec?: Codec;
+    reconnect?: { minMs?: number; maxMs?: number; factor?: number } | false;
+  } = {},
+): Transport {
   const codec = options.codec ?? binaryCodec;
-  const socket = new WebSocket(url);
-  socket.binaryType = 'arraybuffer';
+  const reconnect =
+    options.reconnect === false
+      ? null
+      : { minMs: 250, maxMs: 5000, factor: 2, ...(options.reconnect ?? {}) };
+  let socket!: WebSocket;
+  let handler: ((frame: Frame) => void) | undefined;
+  let reopened: (() => void) | undefined;
   const queue: Frame[] = [];
-  socket.addEventListener('open', () => {
-    for (const frame of queue.splice(0)) socket.send(codec.encode(frame));
-  });
+  let closed = false;
+  let everOpened = false;
+  let delay = reconnect?.minMs ?? 0;
+
+  const dial = (): void => {
+    socket = new WebSocket(url);
+    socket.binaryType = 'arraybuffer';
+    socket.addEventListener('open', () => {
+      const isReopen = everOpened;
+      everOpened = true;
+      delay = reconnect?.minMs ?? 0; // a good connection resets the backoff
+      for (const frame of queue.splice(0)) socket.send(codec.encode(frame));
+      if (isReopen) reopened?.(); // the node re-hellos here — Erlang's re-handshake
+    });
+    socket.addEventListener('message', (event: MessageEvent) => {
+      const data =
+        event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : String(event.data);
+      handler?.(codec.decode(data));
+    });
+    socket.addEventListener('error', () => {}); // close always follows; keep it un-thrown
+    socket.addEventListener('close', () => {
+      if (closed || !reconnect) return;
+      setTimeout(dial, delay); // exponential backoff redial
+      delay = Math.min(delay * reconnect.factor, reconnect.maxMs);
+    });
+  };
+  dial();
+
   return {
     send(frame) {
       if (socket.readyState === WebSocket.OPEN) socket.send(codec.encode(frame));
-      else queue.push(frame);
+      else queue.push(frame); // held across the outage, flushed on reopen
+    },
+    onFrame(h) {
+      handler = h;
+    },
+    onReopen(cb) {
+      reopened = cb;
+    },
+    close() {
+      closed = true;
+      socket.close();
+    },
+  };
+}
+
+/**
+ * Wraps a transport to observe every frame in and out — Erlang's `:dbg` seam, toggled like a
+ * flag. Pure passthrough; `onFrame(direction, frame)` sees a structured clone-safe copy for
+ * logging, recording, or a live trace view. Compose it around any transport.
+ *
+ * ```ts
+ * import { memoryHub } from './node.ts';
+ *
+ * const log: string[] = [];
+ * const hub = memoryHub();
+ * const traced = traceTransport(hub.transport(), (dir, frame) => log.push(`${dir}:${frame.kind}`));
+ * traced.send({ kind: 'hello', from: 'a@traced' });
+ * log; // ['out:hello']
+ * ```
+ */
+export function traceTransport(
+  inner: Transport,
+  onFrame: (direction: 'in' | 'out', frame: Frame) => void,
+): Transport {
+  return {
+    send(frame) {
+      onFrame('out', frame);
+      inner.send(frame);
     },
     onFrame(handler) {
-      socket.addEventListener('message', (event: MessageEvent) => {
-        const data =
-          event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : String(event.data);
-        handler(codec.decode(data));
+      inner.onFrame((frame) => {
+        onFrame('in', frame);
+        handler(frame);
       });
     },
-    close: () => socket.close(),
+    onReopen: inner.onReopen ? (cb) => inner.onReopen!(cb) : undefined,
+    close: inner.close ? () => inner.close!() : undefined,
   };
 }
