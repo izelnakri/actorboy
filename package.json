@@ -117,6 +117,7 @@
   "devDependencies": {
     "@types/node": "^26.1.2",
     "@types/ws": "^8.18.1",
+    "postgres": "^3.4.9",
     "prettier": "^3.9.5",
     "promises-aplus-tests": "^2.1.2",
     "qunitx": "^1.2.18",

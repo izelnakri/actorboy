@@ -3,6 +3,7 @@
   "specifiers": {
     "npm:@types/node@^26.1.2": "26.1.2",
     "npm:@types/ws@^8.18.1": "8.18.1",
+    "npm:postgres@^3.4.9": "3.4.9",
     "npm:prettier@^3.9.5": "3.9.5",
     "npm:promises-aplus-tests@^2.1.2": "2.1.2",
     "npm:qunitx@^1.2.18": "1.2.18",
@@ -561,6 +562,9 @@
     "possible-typed-array-names@1.1.0": {
       "integrity": "sha512-/+5VFTchJDoVj3bhoqi6UeymcD00DAwb1nJwamzPvHEszJ4FpF6SNNbUbOS8yI56qHzdV8eK0qEfOSiodkTdxg=="
     },
+    "postgres@3.4.9": {
+      "integrity": "sha512-GD3qdB0x1z9xgFI6cdRD6xu2Sp2WCOEoe3mtnyB5Ee0XrrL5Pe+e4CCnJrRMnL1zYtRDZmQQVbvOttLnKDLnaw=="
+    },
     "prettier@3.9.5": {
       "integrity": "sha512-/FVl766LpUfB5vXgCYOYa0MeV/441Ia99AeICQIQFTY/Nw0roZwULcXpku5i1/m5kt/baz+s4Zogspd839HSMg==",
       "bin": true
@@ -790,6 +794,7 @@
   },
   "workspace": {
     "dependencies": [
+      "npm:postgres@^3.4.9",
       "npm:qunitx@^1.2.18",
       "npm:ws@^8.21.0"
     ],
@@ -797,6 +802,7 @@
       "dependencies": [
         "npm:@types/node@^26.1.2",
         "npm:@types/ws@^8.18.1",
+        "npm:postgres@^3.4.9",
         "npm:prettier@^3.9.5",
         "npm:promises-aplus-tests@^2.1.2",
         "npm:qunitx@^1.2.18",
